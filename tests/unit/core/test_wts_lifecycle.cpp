@@ -9,12 +9,12 @@
  * 1. Window close -> pending zone persistence (P0 crash/data-loss)
  * 2. Pre-snap geometry stable ID migration on close
  * 3. Pre-float zone conversion on close
- * 4. Layout change -> stale assignment removal and resnap buffer
+ * 4. PhosphorZones::Layout change -> stale assignment removal and resnap buffer
  * 5. State change signal emission
  *
  * WIRE FORMAT NOTE: These tests construct WTS without a WindowRegistry, so
  * they drive legacy-compat "appId|uuid" composite fixtures to exercise the
- * Utils::extractAppId fallback path inside currentAppIdFor(). Production
+ * PhosphorIdentity::WindowId::extractAppId fallback path inside currentAppIdFor(). Production
  * daemons set a registry and receive bare instance ids — see
  * test_wts_registry_integration.cpp and test_wta_reactive_metadata.cpp for
  * coverage of the live path.
@@ -31,97 +31,25 @@
 #include <QRectF>
 #include <memory>
 
-#include "core/windowtrackingservice.h"
-#include "core/layoutmanager.h"
+#include <PhosphorPlacement/WindowTrackingService.h>
+#include <PhosphorSnapEngine/SnapEngine.h>
+#include <PhosphorZones/LayoutRegistry.h>
+#include <PhosphorSnapEngine/SnapState.h>
+#include "config/configbackends.h"
 #include "core/interfaces.h"
-#include "core/layout.h"
-#include "core/zone.h"
-#include "core/virtualdesktopmanager.h"
+#include <PhosphorZones/Layout.h>
+#include <PhosphorZones/Zone.h>
+#include <PhosphorWorkspaces/VirtualDesktopManager.h>
 #include "core/utils.h"
 #include "../helpers/IsolatedConfigGuard.h"
 
-using namespace PlasmaZones;
-using PlasmaZones::TestHelpers::IsolatedConfigGuard;
-
-// =========================================================================
-// Stub Settings
-// =========================================================================
-
 #include "../helpers/StubSettings.h"
+#include "../helpers/StubZoneDetector.h"
 
-using StubSettingsLifecycle = StubSettings;
-
-// =========================================================================
-// Stub Zone Detector
-// =========================================================================
-
-class StubZoneDetectorLifecycle : public IZoneDetector
-{
-    Q_OBJECT
-public:
-    explicit StubZoneDetectorLifecycle(QObject* parent = nullptr)
-        : IZoneDetector(parent)
-    {
-    }
-    Layout* layout() const override
-    {
-        return m_layout;
-    }
-    void setLayout(Layout* layout) override
-    {
-        m_layout = layout;
-    }
-    ZoneDetectionResult detectZone(const QPointF&) const override
-    {
-        return {};
-    }
-    ZoneDetectionResult detectMultiZone(const QPointF&) const override
-    {
-        return {};
-    }
-    Zone* zoneAtPoint(const QPointF&) const override
-    {
-        return nullptr;
-    }
-    Zone* nearestZone(const QPointF&) const override
-    {
-        return nullptr;
-    }
-    QVector<Zone*> expandPaintedZonesToRect(const QVector<Zone*>&) const override
-    {
-        return {};
-    }
-    void highlightZone(Zone*) override
-    {
-    }
-    void highlightZones(const QVector<Zone*>&) override
-    {
-    }
-    void clearHighlights() override
-    {
-    }
-
-private:
-    Layout* m_layout = nullptr;
-};
-
-// =========================================================================
-// Helper
-// =========================================================================
-
-static Layout* createTestLayout(int zoneCount, QObject* parent)
-{
-    auto* layout = new Layout(QStringLiteral("TestLayout"), parent);
-    for (int i = 0; i < zoneCount; ++i) {
-        auto* zone = new Zone(layout);
-        qreal x = static_cast<qreal>(i) / zoneCount;
-        qreal w = 1.0 / zoneCount;
-        zone->setRelativeGeometry(QRectF(x, 0.0, w, 1.0));
-        zone->setZoneNumber(i + 1);
-        layout->addZone(zone);
-    }
-    return layout;
-}
+using namespace PlasmaZones;
+using PhosphorEngine::ZoneAssignmentEntry;
+using namespace PhosphorSnapEngine;
+using PlasmaZones::TestHelpers::IsolatedConfigGuard;
 
 // =========================================================================
 // Test Class
@@ -136,23 +64,31 @@ private Q_SLOTS:
     {
         m_guard = std::make_unique<IsolatedConfigGuard>();
         // Pass nullptr as parent to avoid double-delete: cleanup() deletes manually
-        m_layoutManager = new LayoutManager(nullptr);
-        m_settings = new StubSettingsLifecycle(nullptr);
-        m_zoneDetector = new StubZoneDetectorLifecycle(nullptr);
-        m_service = new WindowTrackingService(m_layoutManager, m_zoneDetector, m_settings, nullptr, nullptr);
+        m_layoutManager = new PhosphorZones::LayoutRegistry(PlasmaZones::createAssignmentsBackend(),
+                                                            QStringLiteral("plasmazones/layouts"));
+        m_settings = new StubSettings(nullptr);
+        m_zoneDetector = new StubZoneDetector(nullptr);
+        m_service = new PhosphorPlacement::WindowTrackingService(m_layoutManager, m_zoneDetector, nullptr, nullptr);
+        m_engine = new SnapEngine(m_layoutManager, m_service, m_zoneDetector, nullptr, nullptr);
+        m_engine->setEngineSettings(m_settings);
+        m_service->setSnapState(m_engine->snapState());
+        m_service->setSnapEngine(m_engine);
 
         m_testLayout = createTestLayout(3, m_layoutManager);
         m_layoutManager->addLayout(m_testLayout);
         m_layoutManager->setActiveLayout(m_testLayout);
 
         m_zoneIds.clear();
-        for (Zone* z : m_testLayout->zones()) {
+        for (PhosphorZones::Zone* z : m_testLayout->zones()) {
             m_zoneIds.append(z->id().toString());
         }
     }
 
     void cleanup()
     {
+        m_service->setSnapState(nullptr);
+        delete m_engine;
+        m_engine = nullptr;
         delete m_service;
         m_service = nullptr;
         delete m_zoneDetector;
@@ -167,13 +103,13 @@ private Q_SLOTS:
     }
 
     // =====================================================================
-    // P0: Window Close -> Pending Zone Persistence
+    // P0: Window Close -> Pending PhosphorZones::Zone Persistence
     // =====================================================================
 
     void testWindowClosed_persistsZoneToPending()
     {
         QString windowId = QStringLiteral("firefox|12345");
-        QString appId = Utils::extractAppId(windowId);
+        QString appId = PhosphorIdentity::WindowId::extractAppId(windowId);
 
         m_service->assignWindowToZone(windowId, m_zoneIds[0], QStringLiteral("DP-1"), 1);
         QVERIFY(m_service->isWindowSnapped(windowId));
@@ -188,7 +124,7 @@ private Q_SLOTS:
     void testWindowClosed_floatingWindowNotPersisted()
     {
         QString windowId = QStringLiteral("firefox|12345");
-        QString appId = Utils::extractAppId(windowId);
+        QString appId = PhosphorIdentity::WindowId::extractAppId(windowId);
 
         m_service->assignWindowToZone(windowId, m_zoneIds[0], QStringLiteral("DP-1"), 1);
         m_service->setWindowFloating(windowId, true);
@@ -201,24 +137,23 @@ private Q_SLOTS:
     void testWindowClosed_preTileGeometryConvertedToStableId()
     {
         QString windowId = QStringLiteral("org.kde.dolphin|99999");
-        QString appId = Utils::extractAppId(windowId);
+        QString appId = PhosphorIdentity::WindowId::extractAppId(windowId);
 
-        m_service->storePreTileGeometry(windowId, QRect(100, 200, 800, 600));
-        QVERIFY(m_service->hasPreTileGeometry(windowId));
+        m_engine->storeUnmanagedGeometry(windowId, QRect(100, 200, 800, 600), QString());
+        QVERIFY(m_engine->hasUnmanagedGeometry(windowId));
 
         m_service->windowClosed(windowId);
 
-        QVERIFY(m_service->hasPreTileGeometry(appId));
-        auto geo = m_service->preTileGeometry(appId);
-        QVERIFY(geo.has_value());
-        QCOMPARE(geo->x(), 100);
-        QCOMPARE(geo->width(), 800);
+        QVERIFY(m_engine->hasUnmanagedGeometry(appId));
+        QRect geo = m_engine->unmanagedGeometry(appId);
+        QCOMPARE(geo.x(), 100);
+        QCOMPARE(geo.width(), 800);
     }
 
     void testWindowClosed_floatStateClearedOnClose()
     {
         QString windowId = QStringLiteral("org.kde.kate|55555");
-        QString appId = Utils::extractAppId(windowId);
+        QString appId = PhosphorIdentity::WindowId::extractAppId(windowId);
 
         m_service->assignWindowToZone(windowId, m_zoneIds[1], QStringLiteral("DP-1"), 1);
         m_service->unsnapForFloat(windowId);
@@ -240,14 +175,147 @@ private Q_SLOTS:
         QString windowId = QStringLiteral("app|12345");
         m_service->assignWindowToZone(windowId, m_zoneIds[0], QStringLiteral("DP-1"), 1);
 
-        QSignalSpy spy(m_service, &WindowTrackingService::stateChanged);
+        QSignalSpy spy(m_service, &PhosphorPlacement::WindowTrackingService::stateChanged);
         m_service->windowClosed(windowId);
 
         QVERIFY(spy.count() >= 1);
     }
 
+    void testWindowClosed_skipsPendingRestoreWhenPredicateRejects()
+    {
+        // Discussion #461 item 2: a window closing on a monitor/desktop the
+        // user has disabled snapping for must not record a PendingRestore.
+        // Without the gate, the entry resurfaces when the same app reopens
+        // anywhere — yanking the window into a zone the user told us to
+        // leave alone. The predicate returns false for the disabled screen
+        // AND asserts the argument tuple so a future signature reshuffle
+        // (swapping screenId/desktop, etc.) trips this test rather than
+        // silently passing.
+        const QString disabledScreen = QStringLiteral("AOC:24B2W1G5:116");
+        int predicateCallCount = 0;
+        QString lastScreenId;
+        int lastDesktop = -1;
+        m_service->setShouldTrackPredicate([&](const QString& screenId, int desktop) {
+            ++predicateCallCount;
+            lastScreenId = screenId;
+            lastDesktop = desktop;
+            return false;
+        });
+
+        const QString windowId = QStringLiteral("vesktop|deadbeef-0000-0000-0000-000000000001");
+        const QString appId = PhosphorIdentity::WindowId::extractAppId(windowId);
+
+        // Plain snapped setup — predicate gate behaviour holds without
+        // depending on incidental float churn. Float-clearing on close has
+        // its own dedicated test (testWindowClosed_floatStateClearedOnClose).
+        m_service->assignWindowToZone(windowId, m_zoneIds[0], disabledScreen, 1);
+        QVERIFY(m_service->isWindowSnapped(windowId));
+
+        QSignalSpy stateSpy(m_service, &PhosphorPlacement::WindowTrackingService::stateChanged);
+        m_service->windowClosed(windowId);
+
+        // Predicate-argument contract: exactly one invocation, and the
+        // tuple it received matches what the placement library promised
+        // to pass (current screen, current desktop). Comparing fields
+        // individually gives a useful failure message — "Expected DP-1
+        // got DP-2" instead of "everyCallMatched was false".
+        QCOMPARE(predicateCallCount, 1);
+        QCOMPARE(lastScreenId, disabledScreen);
+        QCOMPARE(lastDesktop, 1);
+
+        // The rest of windowClosed's cleanup must still run even when the
+        // pending-restore write is suppressed: zone unassigned, floating
+        // state cleared (both windowId and appId keys), stateChanged
+        // emitted. A silent regression in any of these would leak just as
+        // badly as the original bug.
+        QVERIFY(!m_service->isWindowSnapped(windowId));
+        QVERIFY(!m_service->pendingRestoreQueues().contains(appId));
+        QVERIFY(!m_service->isWindowFloating(windowId));
+        QVERIFY(!m_service->isWindowFloating(appId));
+        QVERIFY(stateSpy.count() >= 1);
+    }
+
+    void testWindowClosed_predicateAcceptsEnabledContext()
+    {
+        // Sanity counterpart: when the predicate accepts the closing context,
+        // the historical persist-on-close behavior is preserved. Same
+        // accumulator pattern — a regression that fires the predicate
+        // with the wrong tuple, or fires it more than once with mismatched
+        // arguments, is caught.
+        int predicateCallCount = 0;
+        QString lastScreenId;
+        int lastDesktop = -1;
+        m_service->setShouldTrackPredicate([&](const QString& screenId, int desktop) {
+            ++predicateCallCount;
+            lastScreenId = screenId;
+            lastDesktop = desktop;
+            return true;
+        });
+
+        const QString windowId = QStringLiteral("firefox|cafef00d-0000-0000-0000-000000000001");
+        const QString appId = PhosphorIdentity::WindowId::extractAppId(windowId);
+
+        m_service->assignWindowToZone(windowId, m_zoneIds[0], QStringLiteral("DP-1"), 1);
+        m_service->windowClosed(windowId);
+
+        QCOMPARE(predicateCallCount, 1);
+        QCOMPARE(lastScreenId, QStringLiteral("DP-1"));
+        QCOMPARE(lastDesktop, 1);
+        QVERIFY(m_service->pendingRestoreQueues().contains(appId));
+    }
+
+    void testWindowClosed_persistsWhenPredicateUnset()
+    {
+        // Production daemons always wire a predicate via WTA, but unit tests
+        // and library consumers may construct WTS without one. The header's
+        // ShouldTrackPredicate contract promises "When unset, the service
+        // behaves as if every context is active." Lock that explicitly with
+        // a round-trip: install a rejecting predicate then clear it, and
+        // confirm the unset-equivalent persist-everything behaviour is
+        // restored. Catches a future bug where the setter only stores
+        // non-empty functions, or where clearing leaks the prior predicate.
+        m_service->setShouldTrackPredicate([](const QString&, int) {
+            return false;
+        });
+        m_service->setShouldTrackPredicate({});
+
+        const QString windowId = QStringLiteral("alacritty|11112222-3333-4444-5555-666677778888");
+        const QString appId = PhosphorIdentity::WindowId::extractAppId(windowId);
+
+        m_service->assignWindowToZone(windowId, m_zoneIds[0], QStringLiteral("DP-1"), 1);
+        m_service->windowClosed(windowId);
+
+        QVERIFY(m_service->pendingRestoreQueues().contains(appId));
+    }
+
+    void testWindowClosed_persistsZoneToPending_virtualScreen()
+    {
+        // Same as testWindowClosed_persistsZoneToPending but using a virtual screen ID.
+        // Verifies that the pending restore queue entry records the virtual screen ID
+        // rather than falling back to the physical screen ID.
+        const QString windowId = QStringLiteral("konsole|abcdef12-0000-0000-0000-000000000001");
+        const QString vsId = QStringLiteral("DP-1/vs:0");
+        const QString appId = PhosphorIdentity::WindowId::extractAppId(windowId);
+
+        m_service->assignWindowToZone(windowId, m_zoneIds[1], vsId, 1);
+        QVERIFY(m_service->isWindowSnapped(windowId));
+        QCOMPARE(m_service->zoneForWindow(windowId), m_zoneIds[1]);
+
+        m_service->windowClosed(windowId);
+
+        QVERIFY(!m_service->isWindowSnapped(windowId));
+        QVERIFY(m_service->pendingRestoreQueues().contains(appId));
+
+        const auto& queue = m_service->pendingRestoreQueues().value(appId);
+        QVERIFY(!queue.isEmpty());
+
+        const auto& entry = queue.first();
+        QCOMPARE(entry.zoneIds.first(), m_zoneIds[1]);
+        QCOMPARE(entry.screenId, vsId);
+    }
+
     // =====================================================================
-    // P0: Layout Change
+    // P0: PhosphorZones::Layout Change
     // =====================================================================
 
     void testOnLayoutChanged_staleAssignmentsRemoved()
@@ -257,7 +325,7 @@ private Q_SLOTS:
         m_service->assignWindowToZone(windowId, m_zoneIds[0], screen, 0);
         QVERIFY(m_service->isWindowSnapped(windowId));
 
-        Layout* newLayout = createTestLayout(2, m_layoutManager);
+        PhosphorZones::Layout* newLayout = createTestLayout(2, m_layoutManager);
         m_layoutManager->addLayout(newLayout);
         m_layoutManager->assignLayout(screen, m_layoutManager->currentVirtualDesktop(), QString(), newLayout);
         m_layoutManager->setActiveLayout(newLayout);
@@ -275,16 +343,18 @@ private Q_SLOTS:
         m_service->assignWindowToZone(window1, m_zoneIds[0], QString(), 0);
         m_service->assignWindowToZone(window2, m_zoneIds[1], QString(), 0);
 
-        Layout* newLayout = createTestLayout(3, m_layoutManager);
+        PhosphorZones::Layout* newLayout = createTestLayout(3, m_layoutManager);
         m_layoutManager->addLayout(newLayout);
         m_layoutManager->setActiveLayout(newLayout);
         m_service->onLayoutChanged();
 
-        QVector<RotationEntry> resnap = m_service->calculateResnapFromPreviousLayout();
-        // In headless mode the buffer may be empty but the call must not crash.
-        // The original assertion `resnap.size() >= 0` was always true;
-        // we keep this as a smoke-test and document the limitation.
-        Q_UNUSED(resnap);
+        QVector<ZoneAssignmentEntry> resnap = m_engine->calculateResnapFromPreviousLayout();
+        // Two windows were assigned above, so the resnap buffer should contain
+        // entries for both (mapped to the new layout's zones by relative position).
+        // In headless mode zone geometry resolution may differ, but the buffer
+        // must still be populated with the window IDs that were snapped.
+        QVERIFY2(!resnap.isEmpty(), "Resnap buffer must contain entries for the previously-snapped windows");
+        QCOMPARE(resnap.size(), 2);
     }
 
     void testOnLayoutChanged_floatingWindowsExcludedFromResnap()
@@ -293,24 +363,25 @@ private Q_SLOTS:
         m_service->assignWindowToZone(windowId, m_zoneIds[0], QString(), 0);
         m_service->setWindowFloating(windowId, true);
 
-        Layout* newLayout = createTestLayout(3, m_layoutManager);
+        PhosphorZones::Layout* newLayout = createTestLayout(3, m_layoutManager);
         m_layoutManager->addLayout(newLayout);
         m_layoutManager->setActiveLayout(newLayout);
         m_service->onLayoutChanged();
 
-        QVector<RotationEntry> resnap = m_service->calculateResnapFromPreviousLayout();
-        for (const RotationEntry& entry : resnap) {
+        QVector<ZoneAssignmentEntry> resnap = m_engine->calculateResnapFromPreviousLayout();
+        for (const ZoneAssignmentEntry& entry : resnap) {
             QVERIFY(entry.windowId != windowId);
         }
     }
 
 private:
     std::unique_ptr<IsolatedConfigGuard> m_guard;
-    LayoutManager* m_layoutManager = nullptr;
-    StubSettingsLifecycle* m_settings = nullptr;
-    StubZoneDetectorLifecycle* m_zoneDetector = nullptr;
-    WindowTrackingService* m_service = nullptr;
-    Layout* m_testLayout = nullptr;
+    PhosphorZones::LayoutRegistry* m_layoutManager = nullptr;
+    StubSettings* m_settings = nullptr;
+    StubZoneDetector* m_zoneDetector = nullptr;
+    PhosphorPlacement::WindowTrackingService* m_service = nullptr;
+    SnapEngine* m_engine = nullptr;
+    PhosphorZones::Layout* m_testLayout = nullptr;
     QStringList m_zoneIds;
 };
 

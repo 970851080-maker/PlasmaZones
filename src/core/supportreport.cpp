@@ -3,13 +3,13 @@
 
 #include "supportreport.h"
 #include "logging.h"
-#include "screenmanager.h"
-#include "layoutmanager.h"
-#include "layout.h"
-#include "zone.h"
+#include <PhosphorScreens/Manager.h>
+#include <PhosphorZones/LayoutRegistry.h>
+#include <PhosphorZones/Layout.h>
+#include <PhosphorZones/Zone.h>
 #include "version.h"
 #include "../config/configdefaults.h"
-#include "../autotile/AutotileEngine.h"
+#include <PhosphorEngine/IPlacementEngine.h>
 
 #include <QCoreApplication>
 #include <QDir>
@@ -49,32 +49,35 @@ QString SupportReport::redactHomePath(const QString& input)
     return result;
 }
 
-SupportReport::Snapshot SupportReport::collectSnapshot(ScreenManager* screenManager, LayoutManager* layoutManager,
-                                                       AutotileEngine* autotileEngine)
+SupportReport::Snapshot SupportReport::collectSnapshot(Phosphor::Screens::ScreenManager* screenManager,
+                                                       PhosphorZones::LayoutRegistry* layoutManager,
+                                                       PhosphorEngine::IPlacementEngine* autotileEngine)
 {
     Snapshot snap;
 
     if (screenManager) {
         snap.hasScreenManager = true;
-        const QVector<QScreen*> screens = screenManager->screens();
+        const QVector<Phosphor::Screens::PhysicalScreen> screens = screenManager->screens();
         snap.screens.reserve(screens.size());
-        for (QScreen* screen : screens) {
+        for (const Phosphor::Screens::PhysicalScreen& screen : screens) {
             Snapshot::ScreenInfo info;
-            info.name = screen->name();
-            info.geometry = screen->geometry();
-            info.available = ScreenManager::actualAvailableGeometry(screen);
-            info.refreshRate = screen->refreshRate();
-            info.devicePixelRatio = screen->devicePixelRatio();
+            info.name = screen.name;
+            info.geometry = screen.geometry;
+            info.available = screenManager->actualAvailableGeometry(screen);
+            if (screen.qscreen) {
+                info.refreshRate = screen.qscreen->refreshRate();
+                info.devicePixelRatio = screen.qscreen->devicePixelRatio();
+            }
             snap.screens.append(info);
         }
     }
 
     if (layoutManager) {
         snap.hasLayoutManager = true;
-        const QList<Layout*> layouts = layoutManager->layouts();
-        const Layout* active = layoutManager->activeLayout();
+        const QList<PhosphorZones::Layout*> layouts = layoutManager->layouts();
+        const PhosphorZones::Layout* active = layoutManager->activeLayout();
         snap.layouts.reserve(layouts.size());
-        for (Layout* layout : layouts) {
+        for (PhosphorZones::Layout* layout : layouts) {
             Snapshot::LayoutInfo info;
             info.name = layout->name();
             info.id = layout->id().toString();
@@ -87,7 +90,7 @@ SupportReport::Snapshot SupportReport::collectSnapshot(ScreenManager* screenMana
     if (autotileEngine) {
         snap.hasAutotileEngine = true;
         snap.autotileEnabled = autotileEngine->isEnabled();
-        const auto screens = autotileEngine->autotileScreens();
+        const auto screens = autotileEngine->activeScreens();
         snap.autotileScreens = QStringList(screens.begin(), screens.end());
     }
 
@@ -213,14 +216,44 @@ QString SupportReport::sectionAutotile(const Snapshot& snapshot)
     return out;
 }
 
+QString SupportReport::sectionCompositorBridge(const Snapshot& snapshot)
+{
+    if (!snapshot.hasBridgeInfo)
+        return QStringLiteral("*(daemon not running — compositor bridge state unavailable)*\n");
+
+    if (snapshot.bridgeRegistered) {
+        QString out;
+        out += QStringLiteral("**Status:** connected\n");
+        out += QStringLiteral("**Compositor:** %1\n").arg(snapshot.bridgeName);
+        out += QStringLiteral("**Effect protocol version:** %1\n").arg(snapshot.bridgeVersion);
+        if (!snapshot.bridgeCapabilities.isEmpty()) {
+            out += QStringLiteral("**Capabilities:** %1\n").arg(snapshot.bridgeCapabilities.join(QStringLiteral(", ")));
+        }
+        return out;
+    }
+
+    // Not registered: this is the failure mode behind "dragging and shortcuts
+    // do nothing" — the daemon runs fine but has no window control without the
+    // effect. Spell out the fix so the report is self-diagnosing.
+    return QStringLiteral(
+        "**Status:** NOT CONNECTED — the KWin effect has not registered with the daemon.\n\n"
+        "Window dragging, keyboard shortcuts, and snapping cannot work without it. "
+        "Verify that the **PlasmaZones** effect is enabled in System Settings → Desktop Effects, "
+        "then restart the Plasma session so KWin loads it. See the KWin Effect Logs section below "
+        "for why the effect failed to load or register.\n");
+}
+
 QString SupportReport::sectionSession()
 {
     return readAndRedactFile(ConfigDefaults::sessionFilePath(), QStringLiteral("session file"));
 }
 
-static QStringList journalctlArgs(const QString& identifier, int sinceMinutes, bool longForm = false)
+static QStringList journalctlArgs(const QString& identifier, int sinceMinutes, bool longForm = false,
+                                  bool userScope = true)
 {
-    QStringList args{QStringLiteral("--user")};
+    QStringList args;
+    if (userScope)
+        args << QStringLiteral("--user");
     if (longForm) {
         args << QStringLiteral("--identifier=%1").arg(identifier);
     } else {
@@ -245,34 +278,83 @@ static QByteArray runJournalctl(const QStringList& args)
     return proc.readAllStandardOutput();
 }
 
+// Collects the journal for `identifier` over the last `sinceMinutes`. Tries the
+// user journal with -t, then --identifier (some systemd versions report the
+// syslog tag differently), then the system journal (a compositor that is not a
+// systemd user service logs there instead of the user journal). Returns the raw
+// output, or an empty QByteArray if journalctl is unavailable / produced nothing.
+static QByteArray collectJournal(const QString& identifier, int sinceMinutes)
+{
+    QByteArray raw = runJournalctl(journalctlArgs(identifier, sinceMinutes));
+    if (QString::fromUtf8(raw).trimmed().isEmpty())
+        raw = runJournalctl(journalctlArgs(identifier, sinceMinutes, true));
+    if (QString::fromUtf8(raw).trimmed().isEmpty())
+        raw = runJournalctl(journalctlArgs(identifier, sinceMinutes, false, /*userScope=*/false));
+    return raw;
+}
+
+// Caps `lines` to the most recent MaxLogLines, prepending a truncation notice
+// when lines were dropped. Keeping the *newest* lines mirrors what a support
+// archive needs (the entries around a failure) and stays consistent with
+// scripts/plasmazones-report.sh.
+static QString capLogLines(const QStringList& lines)
+{
+    if (lines.size() <= MaxLogLines)
+        return lines.join(QLatin1Char('\n'));
+
+    QString output = QStringLiteral("... (%1 lines total, showing last %2) ...\n").arg(lines.size()).arg(MaxLogLines);
+    output += lines.mid(lines.size() - MaxLogLines).join(QLatin1Char('\n'));
+    return output;
+}
+
 QString SupportReport::sectionLogs(int sinceMinutes)
 {
-    // thread_local for consistency with redactHomePath — sectionLogs runs off the
-    // main thread via QtConcurrent::run in ControlAdaptor::generateSupportReport.
-    thread_local const QString tag = QStringLiteral("plasmazonesd");
-    QByteArray rawOutput = runJournalctl(journalctlArgs(tag, sinceMinutes));
-
-    // Fall back to --identifier if -t returned nothing useful.
-    // Some systemd versions report the syslog tag differently.
-    if (QString::fromUtf8(rawOutput).trimmed().isEmpty()) {
-        rawOutput = runJournalctl(journalctlArgs(tag, sinceMinutes, true));
-    }
-
+    // collectSnapshot()/generateFromSnapshot() run off the main thread via
+    // QtConcurrent::run in ControlAdaptor::generateSupportReport.
+    const QByteArray rawOutput = collectJournal(QStringLiteral("plasmazonesd"), sinceMinutes);
     if (rawOutput.isEmpty())
-        return QStringLiteral("*(journalctl timed out or not available)*\n");
+        return QStringLiteral("*(no log entries in the last %1 minutes, or journalctl unavailable)*\n")
+            .arg(sinceMinutes);
 
-    QString output = QString::fromUtf8(rawOutput);
+    const QString output = QString::fromUtf8(rawOutput);
     if (output.trimmed().isEmpty())
         return QStringLiteral("*(no log entries in the last %1 minutes)*\n").arg(sinceMinutes);
 
-    // Cap line count
-    const QStringList lines = output.split(QLatin1Char('\n'));
-    if (lines.size() > MaxLogLines) {
-        output = QStringLiteral("... (%1 lines total, showing last %2) ...\n").arg(lines.size()).arg(MaxLogLines);
-        output += lines.mid(lines.size() - MaxLogLines).join(QLatin1Char('\n'));
+    return QStringLiteral("```\n%1\n```\n").arg(redactHomePath(capLogLines(output.split(QLatin1Char('\n')))));
+}
+
+QString SupportReport::sectionEffectLogs(int sinceMinutes)
+{
+    // The KWin effect runs inside the kwin_wayland process, so its journal
+    // entries are tagged "kwin_wayland", not "plasmazonesd" — sectionLogs()
+    // never captures them. Without this section a non-registering effect is
+    // invisible in the report.
+    const QByteArray rawOutput = collectJournal(QStringLiteral("kwin_wayland"), sinceMinutes);
+    if (rawOutput.isEmpty())
+        return QStringLiteral(
+                   "*(no kwin_wayland journal in the last %1 minutes, or journalctl unavailable — "
+                   "the KWin effect is likely not loaded)*\n")
+            .arg(sinceMinutes);
+
+    // Keep only PlasmaZones effect lines — the rest of the kwin_wayland journal
+    // is unrelated compositor noise. Every effect logging category begins with
+    // "plasmazones" (e.g. "plasmazones.effect"), and Qt's default message
+    // pattern prints the category, so a substring match catches every line.
+    QStringList kept;
+    const QStringList lines = QString::fromUtf8(rawOutput).split(QLatin1Char('\n'));
+    for (const QString& line : lines) {
+        if (line.contains(QLatin1String("plasmazones"), Qt::CaseInsensitive))
+            kept.append(line);
     }
 
-    return QStringLiteral("```\n%1\n```\n").arg(redactHomePath(output));
+    if (kept.isEmpty()) {
+        return QStringLiteral(
+                   "*(no PlasmaZones effect log entries in the last %1 minutes — "
+                   "the KWin effect is likely not loaded)*\n")
+            .arg(sinceMinutes);
+    }
+
+    return QStringLiteral("```\n%1\n```\n").arg(redactHomePath(capLogLines(kept)));
 }
 
 QString SupportReport::generateFromSnapshot(const Snapshot& snapshot, int sinceMinutes)
@@ -306,12 +388,20 @@ QString SupportReport::generateFromSnapshot(const Snapshot& snapshot, int sinceM
     report += sectionAutotile(snapshot);
     report += QLatin1Char('\n');
 
+    report += QStringLiteral("## Compositor Bridge\n");
+    report += sectionCompositorBridge(snapshot);
+    report += QLatin1Char('\n');
+
     report += QStringLiteral("## Session State\n");
     report += sectionSession();
     report += QLatin1Char('\n');
 
     report += QStringLiteral("## Recent Logs (last %1 minutes)\n").arg(sinceMinutes);
     report += sectionLogs(sinceMinutes);
+    report += QLatin1Char('\n');
+
+    report += QStringLiteral("## KWin Effect Logs (last %1 minutes)\n").arg(sinceMinutes);
+    report += sectionEffectLogs(sinceMinutes);
     report += QLatin1Char('\n');
 
     // Sanitize any literal </details> in section content that would prematurely
@@ -323,8 +413,9 @@ QString SupportReport::generateFromSnapshot(const Snapshot& snapshot, int sinceM
     return report;
 }
 
-QString SupportReport::generate(ScreenManager* screenManager, LayoutManager* layoutManager,
-                                AutotileEngine* autotileEngine, int sinceMinutes)
+QString SupportReport::generate(Phosphor::Screens::ScreenManager* screenManager,
+                                PhosphorZones::LayoutRegistry* layoutManager,
+                                PhosphorEngine::IPlacementEngine* autotileEngine, int sinceMinutes)
 {
     return generateFromSnapshot(collectSnapshot(screenManager, layoutManager, autotileEngine), sinceMinutes);
 }

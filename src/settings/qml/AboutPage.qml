@@ -6,7 +6,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 
-Flickable {
+SettingsFlickable {
     id: root
 
     contentHeight: content.implicitHeight
@@ -44,6 +44,7 @@ Flickable {
 
                 SettingsSwitch {
                     checked: settingsController.daemonRunning
+                    enabled: !settingsController.daemonController.busy
                     onToggled: function(newValue) {
                         settingsController.daemonController.setEnabled(newValue);
                     }
@@ -124,9 +125,9 @@ Flickable {
                     }
 
                     LinkButton {
-                        linkText: i18n("Documentation / Wiki")
+                        linkText: i18n("Documentation")
                         linkIcon: "documentation"
-                        url: "https://github.com/fuddlesworth/PlasmaZones/wiki"
+                        url: "https://phosphor-works.github.io/plasmazones/"
                     }
 
                     LinkButton {

@@ -1,5 +1,6 @@
 # PlasmaZones Release Pipeline
 # Builds distribution packages when a version tag is pushed
+# SPDX-FileCopyrightText: 2026 fuddlesworth
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 name: Release
@@ -9,10 +10,22 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    # Allow manual triggers
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v3.0.0). Must already exist.'
+        required: true
 
+# Default scope is read-only. Only the `release` job and the AUR publish
+# need writes — they opt in via per-job permissions blocks.
 permissions:
-  contents: write
+  contents: read
+
+# Two tag pushes (or a re-run of the same tag dispatch) must not race
+# the delete-and-recreate dance in the `release` job. Serialising per
+# ref keeps multiple in-flight releases out of each other's way.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════
@@ -23,13 +36,53 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
     steps:
       - name: Extract version from tag
         id: version
+        # Pass the user-supplied dispatch input through env (not via ${{ … }}
+        # interpolation into the script body) so a malicious tag value can't
+        # break out of the string and run arbitrary shell — the standard
+        # GitHub Actions script-injection hardening pattern.
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION"
+          set -euo pipefail
+          # On push the ref is refs/tags/v<x>; on manual dispatch we
+          # accept an explicit tag input. Fail loudly if neither yields
+          # a tag-shaped value so downstream packaging steps don't see
+          # `heads/v3` or empty.
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+              REF="refs/tags/${INPUT_TAG#refs/tags/}"
+          else
+              REF="$GITHUB_REF"
+          fi
+          if [[ "$REF" != refs/tags/v* ]]; then
+              echo "Error: refusing to release from non-tag ref: $REF" >&2
+              exit 1
+          fi
+          VERSION="${REF#refs/tags/v}"
+          # Strict format gate: anything that interpolates this into a
+          # `run:` body downstream (PKGBUILD heredoc, sed `s/^Version:/`,
+          # tarball filenames) must not allow shell metacharacters. Tags
+          # outside this shape are refused before they propagate. The
+          # pre-release suffix requires either no digits (`-rc`) or at
+          # least one digit (`-rc1` / `-rc.1`) — a trailing dot like
+          # `v3.0.0-rc.` is rejected as malformed.
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.?[0-9]+)?)?$ ]]; then
+              echo "Error: VERSION '$VERSION' is not in <major>.<minor>.<patch>[-alpha|beta|rc[.N|N]] form" >&2
+              exit 1
+          fi
+          # Pre-release detection: canonical semver-ish suffixes (-alpha
+          # / -alpha1 / -beta.3 / -rc / -rc1 / -rc.1). A tag like
+          # v3.0.0-arch1 is rejected by the gate above as non-semver.
+          IS_PRE=false
+          if [[ "$VERSION" =~ -(alpha|beta|rc)(\.?[0-9]+)?$ ]]; then
+              IS_PRE=true
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRE" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION (prerelease=$IS_PRE)"
 
   # ═══════════════════════════════════════════════════════════════════════════
   # Build Debian Package (KDE Neon - ships Plasma/KF6 6.6+)
@@ -73,17 +126,29 @@ jobs:
         run: bash packaging/generate-changelog.sh debian
 
       - name: Build Debian package
+        # Force bash: this step uses `set -o pipefail` and `compgen`, both
+        # bash builtins. The KDE Neon container's /bin/sh is dash, and
+        # GitHub's container default shell resolved to sh here, so the
+        # step aborted on 'Illegal option -o pipefail'.
+        shell: bash
         run: |
-          # dpkg-buildpackage expects debian/ at project root
-          ln -s packaging/debian debian
+          set -euo pipefail
+          # dpkg-buildpackage expects debian/ at project root. Remove any
+          # pre-existing entry first — `ln -sfn` only replaces symlinks,
+          # not a real directory left behind by an earlier step or rerun.
+          rm -rf debian
+          ln -sfn packaging/debian debian
           dpkg-buildpackage -us -uc -b
           mkdir -p dist
           mv ../*.deb dist/
-          # Include debug symbol packages (.ddeb) if generated
-          mv ../*.ddeb dist/ 2>/dev/null || true
+          # Move debug symbol packages explicitly via find so a missing
+          # .ddeb file fails loudly instead of being swallowed by glob.
+          if compgen -G "../*.ddeb" >/dev/null; then
+              mv ../*.ddeb dist/
+          fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: deb-kde-neon
           path: dist/*.*deb
@@ -127,19 +192,34 @@ jobs:
       - name: Setup rpmbuild
         run: rpmdev-setuptree
 
-      - name: Create source tarball
-        run: |
-          VERSION="${{ needs.version.outputs.version }}"
-          mkdir -p PlasmaZones-${VERSION}
-          # Copy source files (exclude .git and build artifacts)
-          tar --exclude='.git' --exclude='build' -cf - . | tar -xf - -C PlasmaZones-${VERSION}/
-          tar czf ~/rpmbuild/SOURCES/plasmazones-${VERSION}.tar.gz PlasmaZones-${VERSION}
-
+      # Template the version FIRST so the source tarball baked into the
+      # SRPM carries the matching spec rather than the 0.0.0 placeholder.
       - name: Generate RPM changelog and set version from CHANGELOG.md
         run: |
           VERSION="${{ needs.version.outputs.version }}"
           sed -i "s/^Version:.*/Version:        $VERSION/" packaging/rpm/plasmazones.spec
           bash packaging/generate-changelog.sh rpm
+
+      - name: Create source tarball
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          mkdir -p PlasmaZones-${VERSION}
+          # Copy source files. Exclude anything produced by prior steps
+          # in this workflow so re-runs in the same workspace don't pull
+          # build artifacts into the SRPM tarball, and exclude the
+          # tarball-staging directory itself so tar doesn't recurse into
+          # the in-progress copy.
+          tar \
+              --exclude='./.git' \
+              --exclude='./build' \
+              --exclude='./dist' \
+              --exclude='./install' \
+              --exclude='./AppDir' \
+              --exclude='./result' \
+              --exclude='./artifacts' \
+              --exclude="./PlasmaZones-${VERSION}" \
+              -cf - . | tar -xf - -C "PlasmaZones-${VERSION}/"
+          tar czf ~/rpmbuild/SOURCES/plasmazones-${VERSION}.tar.gz PlasmaZones-${VERSION}
 
       - name: Build RPM
         run: |
@@ -149,7 +229,7 @@ jobs:
           cp ~/rpmbuild/RPMS/*/*.rpm dist/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: rpm-fedora-${{ matrix.fedora }}
           path: dist/*.rpm
@@ -179,7 +259,7 @@ jobs:
         run: |
           zypper -n install \
             cmake ninja extra-cmake-modules gcc-c++ \
-            qt6-core-private-devel qt6-gui-private-devel \
+            qt6-core-private-devel qt6-gui-private-devel qt6-quick-private-devel \
             'cmake(Qt6Core)' 'cmake(Qt6DBus)' 'cmake(Qt6Gui)' \
             'cmake(Qt6Qml)' 'cmake(Qt6Quick)' 'cmake(Qt6QuickControls2)' \
             'cmake(Qt6Widgets)' 'cmake(Qt6Concurrent)' \
@@ -195,18 +275,28 @@ jobs:
       - name: Setup rpmbuild
         run: rpmdev-setuptree
 
-      - name: Create source tarball
-        run: |
-          VERSION="${{ needs.version.outputs.version }}"
-          mkdir -p PlasmaZones-${VERSION}
-          tar --exclude='.git' --exclude='build' -cf - . | tar -xf - -C PlasmaZones-${VERSION}/
-          tar czf ~/rpmbuild/SOURCES/plasmazones-${VERSION}.tar.gz PlasmaZones-${VERSION}
-
       - name: Generate RPM changelog and set version from CHANGELOG.md
         run: |
           VERSION="${{ needs.version.outputs.version }}"
           sed -i "s/^Version:.*/Version:        $VERSION/" packaging/rpm/plasmazones.spec
           bash packaging/generate-changelog.sh rpm
+
+      - name: Create source tarball
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          mkdir -p PlasmaZones-${VERSION}
+          # Same exclude list as build-rpm above — keep them in sync.
+          tar \
+              --exclude='./.git' \
+              --exclude='./build' \
+              --exclude='./dist' \
+              --exclude='./install' \
+              --exclude='./AppDir' \
+              --exclude='./result' \
+              --exclude='./artifacts' \
+              --exclude="./PlasmaZones-${VERSION}" \
+              -cf - . | tar -xf - -C "PlasmaZones-${VERSION}/"
+          tar czf ~/rpmbuild/SOURCES/plasmazones-${VERSION}.tar.gz PlasmaZones-${VERSION}
 
       - name: Build RPM
         run: |
@@ -216,7 +306,7 @@ jobs:
           cp ~/rpmbuild/RPMS/*/*.rpm dist/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: rpm-opensuse-tumbleweed
           path: dist/*.rpm
@@ -231,6 +321,8 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: archlinux:latest
+    outputs:
+      kwin-version: ${{ steps.kwin-version.outputs.version }}
 
     steps:
       - name: Install prerequisites
@@ -250,6 +342,16 @@ jobs:
             kconfig kconfigwidgets \
             kcmutils kglobalaccel \
             qt6-wayland plasma-activities
+
+      - name: Capture build-time KWin version
+        id: kwin-version
+        # The kwin-effect plugin's IID embeds KWin's exact upstream version.
+        # We record the version we built against so the binary AUR PKGBUILD
+        # can pin to it (KWin refuses to load effects with mismatched IIDs).
+        run: |
+          KWIN_VER=$(pacman -Q kwin | awk '{print $2}' | cut -d- -f1)
+          echo "version=$KWIN_VER" >> "$GITHUB_OUTPUT"
+          echo "Built against KWin $KWIN_VER"
 
       - name: Configure
         run: |
@@ -277,6 +379,11 @@ jobs:
           mkdir -p "$DIRNAME"
           mv AppDir/usr "$DIRNAME/"
 
+          # License files at the tarball root. A binary distribution must
+          # carry its own licenses, and the AUR plasmazones-bin package —
+          # which only ever has this tarball — installs them from here.
+          cp LICENSE COPYING.LESSER "$DIRNAME/"
+
           # Copy installer and uninstaller scripts to root of tarball
           cp packaging/local-install/install.sh "$DIRNAME/"
           cp packaging/local-install/uninstall.sh "$DIRNAME/"
@@ -295,7 +402,7 @@ jobs:
           tar czf plasmazones-${VERSION}-linux-x86_64.tar.gz "$DIRNAME"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: generic-linux-tarball
           path: plasmazones-*-linux-x86_64.tar.gz
@@ -353,12 +460,15 @@ jobs:
           pkgdesc="Window tiling and autotiling for KDE Plasma"
           arch=('x86_64')
           url="https://github.com/fuddlesworth/PlasmaZones"
-          license=('GPL-3.0-or-later')
+          license=('GPL-3.0-or-later' 'LGPL-2.1-or-later')
+          # Exact KWin upstream pin — mirrors packaging/arch/PKGBUILD. kwin is
+          # installed in the CI build env, so this resolves at parse time.
+          _kwin_ver=$(pacman -Q kwin 2>/dev/null | awk '{print $2}' | cut -d- -f1)
           depends=(
-              'qt6-base' 'qt6-declarative'
-              'kconfig' 'kconfigwidgets'
-              'kcmutils' 'kglobalaccel'
-              'kirigami'
+              'qt6-base' 'qt6-declarative' 'qt6-shadertools' 'qt6-svg'
+              'kconfig' 'kconfigwidgets' 'kirigami'
+              'kcmutils' 'kglobalaccel' 'qt6-wayland'
+              "kwin${_kwin_ver:+=}${_kwin_ver}"
           )
           makedepends=('cmake' 'extra-cmake-modules' 'qt6-tools' 'ninja')
           optdepends=('plasma-activities: activity-based layouts')
@@ -406,7 +516,7 @@ jobs:
           mv packaging/arch/*.pkg.tar.zst dist/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: arch-package
           path: dist/*.pkg.tar.zst
@@ -425,7 +535,8 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        # SHA-pinned to match ci.yml; bump together when verifying a new release.
+        uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -440,62 +551,14 @@ jobs:
 
       - name: Generate release package.nix
         run: |
-          VERSION="${{ needs.version.outputs.version }}"
-          TARBALL="https://github.com/fuddlesworth/PlasmaZones/archive/refs/tags/v${VERSION}.tar.gz"
-          echo "Fetching source hash for $TARBALL"
-          NIX_HASH=$(nix-prefetch-url --unpack "$TARBALL" 2>/dev/null)
-          SRI_HASH=$(nix hash to-sri --type sha256 "$NIX_HASH")
-          echo "SRI hash: $SRI_HASH"
-
-          # Transform packaging/nix/package.nix into a standalone release file
-          # by replacing src parameter with fetchFromGitHub and baking in version/hash
-          awk -v version="$VERSION" -v hash="$SRI_HASH" '
-            # Replace header comments with release usage
-            NR == 1 {
-              print "# PlasmaZones " version " — Nix package"
-              print "# SPDX-License-Identifier: GPL-3.0-or-later"
-              print "#"
-              print "# Usage:"
-              print "#   environment.systemPackages = ["
-              print "#     (pkgs.callPackage ./plasmazones.nix {})"
-              print "#   ];"
-              next
-            }
-            # Skip remaining header comments
-            !started && /^#/ { next }
-            !started && /^$/ { next }
-            # Begin processing at the parameter list
-            /^\{/ { started = 1 }
-            # Replace src parameter with fetchFromGitHub
-            started && /^  src,$/ { print "  fetchFromGitHub,"; next }
-            # Skip the extractVersion let/in block
-            /^let$/ { in_let = 1; next }
-            in_let && /^in$/ { in_let = 0; next }
-            in_let { next }
-            # Replace dynamic version with hardcoded
-            /version = extractVersion src;/ {
-              print "  version = \"" version "\";"
-              next
-            }
-            # Replace inherit src with fetchFromGitHub block
-            /inherit src;/ {
-              print "  src = fetchFromGitHub {"
-              print "    owner = \"fuddlesworth\";"
-              print "    repo = \"PlasmaZones\";"
-              print "    rev = \"v" version "\";"
-              print "    hash = \"" hash "\";"
-              print "  };"
-              next
-            }
-            # Pass through everything else
-            !in_let { print }
-          ' packaging/nix/package.nix > plasmazones.nix
-
+          # Delegate to the versioned script — keeps the awk pattern in
+          # one place and adds a `nix-instantiate --parse` smoke check.
+          bash packaging/nix/generate-release-nix.sh "${{ needs.version.outputs.version }}"
           echo "=== Generated plasmazones.nix ==="
           cat plasmazones.nix
 
       - name: Upload Nix package artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: nix-package
           path: plasmazones.nix
@@ -508,6 +571,12 @@ jobs:
     name: Create GitHub Release
     needs: [version, build-deb, build-rpm, build-rpm-opensuse, build-arch, build-generic, build-nix]
     runs-on: ubuntu-latest
+    # No `if:` — the implicit success() gate is intentional. If any
+    # package build fails, the release is NOT cut: we don't ship a
+    # partial release. Fix the failing distro and re-run the tag.
+    # Only this job writes release assets back to the repo.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -516,7 +585,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -540,12 +609,12 @@ jobs:
             echo ""
             echo "**Arch Linux (manual):**"
             echo '```bash'
-            echo "sudo pacman -U plasmazones-${VERSION}-1-x86_64.pkg.tar.zst"
+            echo "sudo pacman -U plasmazones-${VERSION}-*-x86_64.pkg.tar.zst"
             echo '```'
             echo ""
             echo "**KDE Neon / Debian-based:**"
             echo '```bash'
-            echo "sudo dpkg -i plasmazones_${VERSION}-1_amd64.deb"
+            echo "sudo dpkg -i plasmazones_${VERSION}-*_amd64.deb"
             echo "sudo apt-get install -f  # Install dependencies if needed"
             echo '```'
             echo ""
@@ -558,23 +627,22 @@ jobs:
             echo "**Fedora (manual RPM):**"
             echo '```bash'
             echo "# Fedora 43"
-            echo "sudo dnf install plasmazones-${VERSION}-1.fc43.x86_64.rpm"
+            echo "sudo dnf install plasmazones-${VERSION}-*.fc43.x86_64.rpm"
             echo "# Fedora 44"
-            echo "sudo dnf install plasmazones-${VERSION}-1.fc44.x86_64.rpm"
+            echo "sudo dnf install plasmazones-${VERSION}-*.fc44.x86_64.rpm"
             echo '```'
             echo ""
             echo "**openSUSE Tumbleweed (manual RPM):**"
             echo '```bash'
-            echo "sudo zypper install plasmazones-${VERSION}-1.x86_64.rpm"
+            echo "sudo zypper install plasmazones-${VERSION}-*.x86_64.rpm"
             echo '```'
             echo ""
             echo "**openSUSE Tumbleweed (OBS):**"
             echo '```bash'
-            echo "sudo zypper addrepo https://download.opensuse.org/repositories/home:ilFrance/openSUSE_Tumbleweed/home:ilFrance.repo"
+            echo "sudo zypper addrepo https://download.opensuse.org/repositories/home:fuddlesworth/openSUSE_Tumbleweed/home:fuddlesworth.repo"
             echo "sudo zypper refresh"
             echo "sudo zypper install plasmazones"
             echo '```'
-            echo "> Community-maintained package by [ilFrance](https://build.opensuse.org/package/show/home:ilFrance/plasmazones)"
             echo ""
             echo "**Universal Linux (AppDir):**"
             echo "For Fedora Atomic, Steam Deck, or non-root user installation:"
@@ -623,27 +691,36 @@ jobs:
       - name: Create Release
         env:
           GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ needs.version.outputs.is_prerelease }}
         run: |
+          set -euo pipefail
           VERSION="v${{ needs.version.outputs.version }}"
-          PRERELEASE_FLAG=""
-          if echo "$VERSION" | grep -qE '(alpha|beta|rc)'; then
-            PRERELEASE_FLAG="--prerelease"
-          fi
-
+          # Source the pre-release verdict from the version job so this
+          # workflow has one regex / one decision point — see the version
+          # job's `is_prerelease` output.
           # Collect all release assets
           ASSETS=()
           while IFS= read -r f; do
             ASSETS+=("$f")
-          done < <(find artifacts -type f \( -name '*.deb' -o -name '*.ddeb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' -o -name '*linux-x86_64.tar.gz' -o -name '*.nix' \))
+          done < <(find artifacts -type f \( -name '*.deb' -o -name '*.ddeb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' -o -name '*linux-x86_64.tar.gz' -o -name 'plasmazones.nix' \))
 
           echo "Uploading ${#ASSETS[@]} assets:"
           printf '  %s\n' "${ASSETS[@]}"
 
+          # --latest implies "this is the canonical stable release";
+          # gh refuses to combine it with --prerelease. Build the flag
+          # list as an array so empty entries don't add stray empty
+          # arguments to the command line.
+          RELEASE_FLAGS=()
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+              RELEASE_FLAGS+=(--prerelease)
+          else
+              RELEASE_FLAGS+=(--latest)
+          fi
           gh release create "$VERSION" \
             --title "PlasmaZones $VERSION" \
             --notes-file release_notes.md \
-            --latest \
-            $PRERELEASE_FLAG \
+            "${RELEASE_FLAGS[@]}" \
             "${ASSETS[@]}"
 
   # ═══════════════════════════════════════════════════════════════════════════
@@ -651,16 +728,19 @@ jobs:
   # ═══════════════════════════════════════════════════════════════════════════
   publish-aur:
     name: Publish to AUR
-    needs: [version, release]
+    needs: [version, release, build-generic]
     runs-on: ubuntu-latest
-    if: ${{ !contains(needs.version.outputs.version, 'alpha') && !contains(needs.version.outputs.version, 'beta') && !contains(needs.version.outputs.version, 'rc') }}
+    # Skip AUR publish for pre-releases. Single source of truth: the
+    # version job's `is_prerelease` output — keeps this in sync with
+    # the GH release's `--prerelease` flag automatically.
+    if: needs.version.outputs.is_prerelease != 'true'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Download generic tarball artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: generic-linux-tarball
           path: dist
@@ -668,9 +748,19 @@ jobs:
       - name: Calculate tarball hash
         id: hash
         run: |
-          TARBALL=$(ls dist/plasmazones-*-linux-x86_64.tar.gz | head -1)
+          set -euo pipefail
+          # Use a nullglob array instead of `ls | head -1` so a missing
+          # tarball fails the step explicitly instead of feeding empty
+          # input into sha256sum and producing a bogus hash.
+          shopt -s nullglob
+          arr=(dist/plasmazones-*-linux-x86_64.tar.gz)
+          if [[ ${#arr[@]} -eq 0 ]]; then
+              echo "Error: no plasmazones-*-linux-x86_64.tar.gz under dist/" >&2
+              exit 1
+          fi
+          TARBALL="${arr[0]}"
           SHA256=$(sha256sum "$TARBALL" | cut -d' ' -f1)
-          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
           echo "Tarball: $TARBALL"
           echo "SHA256: $SHA256"
 
@@ -693,6 +783,7 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.version }}
           SHA256: ${{ steps.hash.outputs.sha256 }}
+          KWIN_VERSION: ${{ needs.build-generic.outputs.kwin-version }}
         run: |
           git clone ssh://aur@aur.archlinux.org/plasmazones-bin.git /tmp/aur-bin
           cd /tmp/aur-bin
@@ -702,20 +793,47 @@ jobs:
           cp "$GITHUB_WORKSPACE/packaging/arch/plasmazones.install" ./
           cp "$GITHUB_WORKSPACE/packaging/arch/LICENSE" ./
 
-          # Update version and hash
+          # Update version and hash. Use the same awk-anchored array
+          # rewrite as the source PKGBUILD (below) so future additional
+          # `source=` entries don't silently leave a stale second hash.
+          # Also pin _kwin_ver to the exact KWin this binary was built
+          # against — the effect plugin IID embeds KWin's version string.
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-          sed -i "s/'[a-f0-9]\{64\}'/'$SHA256'/" PKGBUILD
+          awk -v sum="$SHA256" '
+            # Single-line form: sha256sums=(\047hash\047) — replace inline.
+            /^sha256sums=\(.*\)$/ {
+              print "sha256sums=(\047" sum "\047)"
+              next
+            }
+            # Multi-line form: opening `sha256sums=(` on its own line,
+            # then entries, then a `)` on its own line.
+            /^sha256sums=\(/ {
+              print "sha256sums=("
+              print "    \047" sum "\047"
+              print ")"
+              in_block = 1
+              next
+            }
+            in_block && /^\)/ { in_block = 0; next }
+            in_block { next }
+            { print }
+          ' PKGBUILD > PKGBUILD.new && mv PKGBUILD.new PKGBUILD
+          sed -i "s/^_kwin_ver=.*/_kwin_ver=$KWIN_VERSION/" PKGBUILD
 
-          # Generate .SRCINFO (mount files read-only to avoid chown breaking host git)
+          # Generate .SRCINFO (mount files read-only to avoid chown breaking host git).
+          # Enumerate inputs explicitly rather than `cp /build/*` so a future
+          # mount-path tweak fails loudly instead of producing a .SRCINFO from
+          # whatever happens to be lying around.
           docker run --rm \
             -v "$(pwd)/PKGBUILD:/build/PKGBUILD:ro" \
             -v "$(pwd)/plasmazones.install:/build/plasmazones.install:ro" \
             archlinux:latest bash -c "
-            pacman -Sy --noconfirm pacman >&2
+            set -euo pipefail
+            pacman -Syu --noconfirm >&2
             useradd -m builder
-            cp /build/* /home/builder/
-            chown builder:builder /home/builder/*
+            cp /build/PKGBUILD /build/plasmazones.install /home/builder/
+            chown builder:builder /home/builder/PKGBUILD /home/builder/plasmazones.install
             su builder -c 'cd /home/builder && makepkg --printsrcinfo'
           " > .SRCINFO
 
@@ -746,21 +864,56 @@ jobs:
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
 
-          # Calculate and update source tarball hash
+          # Calculate and update source tarball hash. Anchor inside the
+          # sha256sums=(...) block via awk so future additional hashes
+          # (e.g. for the .install file) aren't silently left stale.
           TARBALL_URL="https://github.com/fuddlesworth/PlasmaZones/archive/refs/tags/v${VERSION}.tar.gz"
-          TARBALL_SHA256=$(curl -sL "$TARBALL_URL" | sha256sum | cut -d' ' -f1)
+          # Stage the tarball to disk first so we can detect both curl
+          # failures and pipe-side errors. Piping `curl | sha256sum`
+          # silently produces a hash of empty input when curl 404s.
+          tmptar=$(mktemp)
+          # --retry-all-errors covers 4xx (GitHub asset propagation race
+          # right after the tag push) and connection refused; --max-time
+          # bounds the worst case so the workflow doesn't hang.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 120 \
+              -o "$tmptar" "$TARBALL_URL"
+          TARBALL_SHA256=$(sha256sum "$tmptar" | cut -d' ' -f1)
+          rm -f "$tmptar"
           echo "Source tarball SHA256: $TARBALL_SHA256"
-          sed -i "s/'[a-f0-9]\{64\}'/'$TARBALL_SHA256'/" PKGBUILD
+          awk -v sum="$TARBALL_SHA256" '
+            # Single-line form: sha256sums=(\047hash\047) — replace inline.
+            /^sha256sums=\(.*\)$/ {
+              print "sha256sums=(\047" sum "\047)"
+              next
+            }
+            # Multi-line form: opening `sha256sums=(` on its own line, then
+            # entries, then a `)` on its own line. Replace the entire array
+            # with a single sum (the source tarball). Add more entries here
+            # when PKGBUILD grows additional source= lines.
+            /^sha256sums=\(/ {
+              print "sha256sums=("
+              print "    \047" sum "\047"
+              print ")"
+              in_block = 1
+              next
+            }
+            in_block && /^\)/ { in_block = 0; next }
+            in_block { next }
+            { print }
+          ' PKGBUILD > PKGBUILD.new && mv PKGBUILD.new PKGBUILD
 
-          # Generate .SRCINFO (mount files read-only to avoid chown breaking host git)
+          # Generate .SRCINFO (mount files read-only to avoid chown breaking host git).
+          # Enumerate inputs explicitly — see the matching note in
+          # publish-aur-bin above.
           docker run --rm \
             -v "$(pwd)/PKGBUILD:/build/PKGBUILD:ro" \
             -v "$(pwd)/plasmazones.install:/build/plasmazones.install:ro" \
             archlinux:latest bash -c "
-            pacman -Sy --noconfirm pacman >&2
+            set -euo pipefail
+            pacman -Syu --noconfirm >&2
             useradd -m builder
-            cp /build/* /home/builder/
-            chown builder:builder /home/builder/*
+            cp /build/PKGBUILD /build/plasmazones.install /home/builder/
+            chown builder:builder /home/builder/PKGBUILD /home/builder/plasmazones.install
             su builder -c 'cd /home/builder && makepkg --printsrcinfo'
           " > .SRCINFO
 
@@ -773,6 +926,121 @@ jobs:
             git commit -m "Update to $VERSION"
             git push
             echo "✅ Published plasmazones $VERSION to AUR"
+          fi
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Publish to openSUSE Build Service (OBS)
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Commits the spec + _service to the home:fuddlesworth/plasmazones OBS
+  # package; OBS then fetches the release tarball (via the download_files
+  # source service) and rebuilds for every enabled repository. Gated on the
+  # GitHub release being created, so all distro builds (including the
+  # openSUSE Tumbleweed RPM smoke build) must succeed first — a spec that
+  # fails to build is never pushed to the repo users have added with
+  # `zypper addrepo`, and we don't publish to OBS for a release that never
+  # made it to GitHub. Runs in parallel with publish-aur.
+  #
+  # Setup (one-time):
+  #   1. Sign in at https://build.opensuse.org with an openSUSE account.
+  #   2. Create project "home:fuddlesworth" and package "plasmazones"
+  #      (Home Project -> Create Package), or via osc:
+  #        osc meta pkg -e home:fuddlesworth plasmazones
+  #   3. In the project's "Repositories" tab add openSUSE_Tumbleweed for
+  #      x86_64 and aarch64. PlasmaZones needs Plasma/KF6/Qt 6.6+, so Leap
+  #      is not a viable target — Tumbleweed (and optionally Slowroll) only.
+  #   4. Add two GitHub Actions secrets (Settings -> Secrets and variables
+  #      -> Actions):
+  #        OBS_USERNAME — your build.opensuse.org login
+  #        OBS_PASSWORD — that account's password
+  #   5. Optionally retire the old home:ilFrance/plasmazones package so
+  #      users are not split across two repositories.
+  publish-obs:
+    name: Publish to openSUSE OBS
+    # `release` already transitively requires build-rpm-opensuse + every
+    # other distro build, so gating here on `release` keeps the smoke-test
+    # gate while also blocking publish if the GitHub release itself fails.
+    # Same shape as publish-aur so the two run as parallel siblings.
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    # Skip pre-releases — the home:fuddlesworth repo users add with
+    # `zypper addrepo` is a stable channel. Single source of truth: the
+    # version job's `is_prerelease` output, same as publish-aur.
+    if: needs.version.outputs.is_prerelease != 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install osc (OBS command-line client)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends osc
+
+      - name: Configure osc credentials
+        env:
+          OBS_USERNAME: ${{ secrets.OBS_USERNAME }}
+          OBS_PASSWORD: ${{ secrets.OBS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${OBS_USERNAME:-}" || -z "${OBS_PASSWORD:-}" ]]; then
+              echo "Error: OBS_USERNAME / OBS_PASSWORD secrets are not set" >&2
+              exit 1
+          fi
+          # Pin the plaintext credentials manager: without it osc falls
+          # back to an interactive keyring prompt on the first API call,
+          # which hangs the runner. The file is chmod 600 and lives only
+          # on the ephemeral CI VM; GitHub masks the secret values in logs.
+          mkdir -p ~/.config/osc
+          cat > ~/.config/osc/oscrc << EOF
+          [general]
+          apiurl = https://api.opensuse.org
+
+          [https://api.opensuse.org]
+          credentials_mgr_class = osc.credentials.PlaintextConfigFileCredentialsManager
+          user = $OBS_USERNAME
+          pass = $OBS_PASSWORD
+          EOF
+          chmod 600 ~/.config/osc/oscrc
+
+      - name: Stamp version and changelog into spec
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          # OBS builds from the committed spec, so it must carry the real
+          # version (download_files resolves Source0's %{version}) and the
+          # release changelog — not the 0.0.0 placeholder. Same templating
+          # as the build-rpm-opensuse job above.
+          sed -i "s/^Version:.*/Version:        $VERSION/" packaging/rpm/plasmazones.spec
+          bash packaging/generate-changelog.sh rpm
+
+      - name: Commit package to OBS
+        env:
+          OBS_PROJECT: home:fuddlesworth
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          # Check out the existing OBS package working copy — the project
+          # and package must already exist (see the setup notes above).
+          osc checkout "$OBS_PROJECT" plasmazones
+          PKGDIR="$OBS_PROJECT/plasmazones"
+          cp packaging/rpm/plasmazones.spec "$PKGDIR/plasmazones.spec"
+          cp packaging/rpm/plasmazones-rpmlintrc "$PKGDIR/plasmazones-rpmlintrc"
+          cp packaging/obs/_service "$PKGDIR/_service"
+          cd "$PKGDIR"
+          # addremove stages new files and drops removed ones; commit only
+          # when something actually changed so re-running the same tag is a
+          # no-op rather than an empty commit. OBS reruns the source service
+          # and rebuilds automatically on every source commit.
+          osc addremove
+          # Capture status on its own line: a failing `osc status` then
+          # aborts the job under `set -e`, instead of being read as an
+          # empty result and silently mistaken for "no changes".
+          STATUS="$(osc status)"
+          if [[ -n "$STATUS" ]]; then
+              osc commit -m "Update to $VERSION"
+              echo "✅ Committed plasmazones $VERSION to $OBS_PROJECT — OBS will rebuild"
+          else
+              echo "No changes to commit"
           fi
 
   # ═══════════════════════════════════════════════════════════════════════════

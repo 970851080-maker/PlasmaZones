@@ -3,7 +3,7 @@
 
 /**
  * @file test_layoutmanager_assignment.cpp
- * @brief Unit tests for LayoutManager fallback cascade, default layout, quick slots
+ * @brief Unit tests for PhosphorZones::LayoutRegistry fallback cascade, default layout, quick slots
  */
 
 #include <QTest>
@@ -14,14 +14,14 @@
 #include <QJsonObject>
 #include <QScopedPointer>
 #include <QUuid>
-#include "config/configbackend_json.h"
+#include "config/configbackends.h"
 #include "config/configdefaults.h"
 #include <memory>
 #include <vector>
 
-#include "core/layoutmanager.h"
-#include "core/layout.h"
-#include "core/zone.h"
+#include <PhosphorZones/LayoutRegistry.h>
+#include <PhosphorZones/Layout.h>
+#include <PhosphorZones/Zone.h>
 #include "core/constants.h"
 #include "../helpers/StubSettings.h"
 #include "../helpers/IsolatedConfigGuard.h"
@@ -34,19 +34,20 @@ class TestLayoutManagerAssignment : public QObject
     Q_OBJECT
 
 private:
-    Layout* createTestLayout(const QString& name, QObject* parent = nullptr)
+    PhosphorZones::Layout* createTestLayout(const QString& name, QObject* parent = nullptr)
     {
-        auto* layout = new Layout(name, parent);
-        auto* zone = new Zone();
+        auto* layout = new PhosphorZones::Layout(name, parent);
+        auto* zone = new PhosphorZones::Zone();
         zone->setRelativeGeometry(QRectF(0, 0, 1, 1));
         layout->addZone(zone);
         return layout;
     }
 
-    LayoutManager* createManager(QObject* parent = nullptr)
+    PhosphorZones::LayoutRegistry* createManager(QObject* parent = nullptr)
     {
         m_guards.emplace_back(std::make_unique<IsolatedConfigGuard>());
-        auto* mgr = new LayoutManager(parent);
+        auto* mgr = new PhosphorZones::LayoutRegistry(PlasmaZones::createAssignmentsBackend(),
+                                                      QStringLiteral("plasmazones/layouts"), parent);
         QString layoutDir = m_guards.back()->dataPath() + QStringLiteral("/plasmazones/layouts");
         QDir().mkpath(layoutDir);
         mgr->setLayoutDirectory(layoutDir);
@@ -68,7 +69,7 @@ private Q_SLOTS:
 
     void testLayoutManager_layoutForScreen_fallbackCascade()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* defaultLayout = createTestLayout(QStringLiteral("Default"));
         mgr->addLayout(defaultLayout);
@@ -86,9 +87,71 @@ private Q_SLOTS:
         // Desktop 1 has no explicit entry — cascades to display default
         QCOMPARE(mgr->layoutForScreen(QStringLiteral("DP-1"), 1)->name(), QStringLiteral("ScreenSpecific"));
 
-        Layout* fallback = mgr->layoutForScreen(QStringLiteral("HDMI-1"));
+        PhosphorZones::Layout* fallback = mgr->layoutForScreen(QStringLiteral("HDMI-1"));
         QVERIFY(fallback != nullptr);
         QCOMPARE(fallback->name(), QStringLiteral("Default"));
+    }
+
+    // Per-activity assignments (stored at virtualDesktop=0 with a
+    // non-empty activity) must be reachable through the cascade and must
+    // win over the monitor-only default. Discussion #413 reported that
+    // toggling activity assignments did nothing — monitor assignments
+    // kept overriding them — because the cascade jumped from
+    // (screen, desktop, activity) straight to (screen, desktop, "") and
+    // (screen, 0, "") with no level matching the way activity entries
+    // are persisted by `setAllActivityAssignments` ((screen, 0, activity)).
+    void testLayoutManager_layoutForScreen_perActivityCascade()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+
+        auto* monitorLayout = createTestLayout(QStringLiteral("MonitorDefault"));
+        mgr->addLayout(monitorLayout);
+        auto* activityLayout = createTestLayout(QStringLiteral("WorkActivity"));
+        mgr->addLayout(activityLayout);
+
+        const QString screen = QStringLiteral("DP-1");
+        const QString workActivity = QStringLiteral("activity-work");
+        const QString playActivity = QStringLiteral("activity-play");
+
+        // Mirror the storage shape `setAllActivityAssignments` uses.
+        mgr->assignLayout(screen, 0, QString(), monitorLayout);
+        mgr->assignLayout(screen, 0, workActivity, activityLayout);
+
+        // In the work activity, on any desktop, activity entry wins.
+        QCOMPARE(mgr->layoutForScreen(screen, 1, workActivity)->name(), QStringLiteral("WorkActivity"));
+        QCOMPARE(mgr->layoutForScreen(screen, 5, workActivity)->name(), QStringLiteral("WorkActivity"));
+
+        // An activity without a per-activity entry falls through to the
+        // monitor default (level 4).
+        QCOMPARE(mgr->layoutForScreen(screen, 1, playActivity)->name(), QStringLiteral("MonitorDefault"));
+
+        // Empty activity (e.g. ActivityManager not initialised) skips
+        // the activity level and lands on the monitor default.
+        QCOMPARE(mgr->layoutForScreen(screen, 1, QString())->name(), QStringLiteral("MonitorDefault"));
+    }
+
+    // Per-activity entries must outrank per-desktop entries when both
+    // are present and the user is in a configured activity. Activities
+    // are a higher-level workspace context than virtual desktops in
+    // KDE Plasma, so the cascade picks activity first.
+    void testLayoutManager_layoutForScreen_activityWinsOverDesktop()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+
+        auto* desktopLayout = createTestLayout(QStringLiteral("DesktopTwo"));
+        mgr->addLayout(desktopLayout);
+        auto* activityLayout = createTestLayout(QStringLiteral("ActivityWork"));
+        mgr->addLayout(activityLayout);
+
+        const QString screen = QStringLiteral("DP-1");
+        const QString workActivity = QStringLiteral("activity-work");
+
+        mgr->assignLayout(screen, 2, QString(), desktopLayout);
+        mgr->assignLayout(screen, 0, workActivity, activityLayout);
+
+        QCOMPARE(mgr->layoutForScreen(screen, 2, workActivity)->name(), QStringLiteral("ActivityWork"));
+        // No activity → desktop entry applies.
+        QCOMPARE(mgr->layoutForScreen(screen, 2, QString())->name(), QStringLiteral("DesktopTwo"));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -97,7 +160,7 @@ private Q_SLOTS:
 
     void testLayoutManager_quickLayoutSlot_validRange_1to9()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* layout = createTestLayout(QStringLiteral("Quick"));
         mgr->addLayout(layout);
@@ -126,9 +189,11 @@ private Q_SLOTS:
 
     void testLayoutManager_defaultLayout_settingsIdTakesPrecedence()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
         auto* settings = new StubSettings(mgr.data());
-        mgr->setSettings(settings);
+        mgr->setDefaultLayoutIdProvider([settings]() {
+            return settings->defaultLayoutId();
+        });
 
         auto* first = createTestLayout(QStringLiteral("First"));
         mgr->addLayout(first);
@@ -144,9 +209,11 @@ private Q_SLOTS:
 
     void testLayoutManager_defaultLayout_fallbackToFirstLayout()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
         auto* settings = new StubSettings(mgr.data());
-        mgr->setSettings(settings);
+        mgr->setDefaultLayoutIdProvider([settings]() {
+            return settings->defaultLayoutId();
+        });
 
         auto* layout = createTestLayout(QStringLiteral("OnlyLayout"));
         mgr->addLayout(layout);
@@ -159,12 +226,12 @@ private Q_SLOTS:
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // P3: AssignmentEntry explicit fields
+    // P3: PhosphorZones::AssignmentEntry explicit fields
     // ═══════════════════════════════════════════════════════════════════════════
 
     void testAssignmentEntry_snappingAssignment_setsFields()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* layout = createTestLayout(QStringLiteral("Manual"));
         mgr->addLayout(layout);
@@ -172,7 +239,7 @@ private Q_SLOTS:
         mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layout);
 
         auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0);
-        QCOMPARE(entry.mode, AssignmentEntry::Snapping);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Snapping);
         QCOMPARE(entry.snappingLayout, layout->id().toString());
         QVERIFY(entry.tilingAlgorithm.isEmpty());
         QCOMPARE(entry.activeLayoutId(), layout->id().toString());
@@ -180,7 +247,7 @@ private Q_SLOTS:
 
     void testAssignmentEntry_autotileAssignment_setsFields()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* layout = createTestLayout(QStringLiteral("Manual"));
         mgr->addLayout(layout);
@@ -192,7 +259,7 @@ private Q_SLOTS:
         mgr->assignLayoutById(QStringLiteral("DP-1"), 0, QString(), QStringLiteral("autotile:wide"));
 
         auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0);
-        QCOMPARE(entry.mode, AssignmentEntry::Autotile);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Autotile);
         QCOMPARE(entry.tilingAlgorithm, QStringLiteral("wide"));
         // snappingLayout should be preserved from the earlier assignment
         QCOMPARE(entry.snappingLayout, layout->id().toString());
@@ -201,7 +268,7 @@ private Q_SLOTS:
 
     void testAssignmentEntry_togglePreservesBothFields()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* layout = createTestLayout(QStringLiteral("Manual"));
         mgr->addLayout(layout);
@@ -212,7 +279,7 @@ private Q_SLOTS:
         mgr->assignLayoutById(QStringLiteral("DP-1"), 0, QString(), QStringLiteral("autotile:dwindle"));
 
         auto entry1 = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0);
-        QCOMPARE(entry1.mode, AssignmentEntry::Autotile);
+        QCOMPARE(entry1.mode, PhosphorZones::AssignmentEntry::Autotile);
         QCOMPARE(entry1.snappingLayout, layout->id().toString());
         QCOMPARE(entry1.tilingAlgorithm, QStringLiteral("dwindle"));
 
@@ -220,7 +287,7 @@ private Q_SLOTS:
         mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layout);
 
         auto entry2 = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0);
-        QCOMPARE(entry2.mode, AssignmentEntry::Snapping);
+        QCOMPARE(entry2.mode, PhosphorZones::AssignmentEntry::Snapping);
         QCOMPARE(entry2.snappingLayout, layout->id().toString());
         QCOMPARE(entry2.tilingAlgorithm, QStringLiteral("dwindle"));
         QCOMPARE(entry2.activeLayoutId(), layout->id().toString());
@@ -228,21 +295,21 @@ private Q_SLOTS:
 
     void testAssignmentEntry_modeForScreen_delegates()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* layout = createTestLayout(QStringLiteral("Manual"));
         mgr->addLayout(layout);
 
         mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layout);
-        QCOMPARE(mgr->modeForScreen(QStringLiteral("DP-1"), 0), AssignmentEntry::Snapping);
+        QCOMPARE(mgr->modeForScreen(QStringLiteral("DP-1"), 0), PhosphorZones::AssignmentEntry::Snapping);
 
         mgr->assignLayoutById(QStringLiteral("DP-1"), 0, QString(), QStringLiteral("autotile:wide"));
-        QCOMPARE(mgr->modeForScreen(QStringLiteral("DP-1"), 0), AssignmentEntry::Autotile);
+        QCOMPARE(mgr->modeForScreen(QStringLiteral("DP-1"), 0), PhosphorZones::AssignmentEntry::Autotile);
     }
 
     void testAssignmentEntry_snappingLayoutForScreen_returnsField()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* layout = createTestLayout(QStringLiteral("Manual"));
         mgr->addLayout(layout);
@@ -256,7 +323,7 @@ private Q_SLOTS:
 
     void testAssignmentEntry_tilingAlgorithmForScreen_returnsField()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* layout = createTestLayout(QStringLiteral("Manual"));
         mgr->addLayout(layout);
@@ -271,7 +338,7 @@ private Q_SLOTS:
 
     void testAssignmentEntry_perDesktop_independentEntries()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
         mgr->addLayout(layoutA);
@@ -285,18 +352,18 @@ private Q_SLOTS:
         mgr->assignLayoutById(QStringLiteral("DP-1"), 2, QString(), QStringLiteral("autotile:dwindle"));
 
         auto entry1 = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 1);
-        QCOMPARE(entry1.mode, AssignmentEntry::Snapping);
+        QCOMPARE(entry1.mode, PhosphorZones::AssignmentEntry::Snapping);
         QCOMPARE(entry1.snappingLayout, layoutA->id().toString());
 
         auto entry2 = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 2);
-        QCOMPARE(entry2.mode, AssignmentEntry::Autotile);
+        QCOMPARE(entry2.mode, PhosphorZones::AssignmentEntry::Autotile);
         QCOMPARE(entry2.snappingLayout, layoutB->id().toString());
         QCOMPARE(entry2.tilingAlgorithm, QStringLiteral("dwindle"));
     }
 
     void testAssignmentEntry_clearAutotile_flipsToSnapping()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* layout = createTestLayout(QStringLiteral("Manual"));
         mgr->addLayout(layout);
@@ -308,9 +375,43 @@ private Q_SLOTS:
         mgr->clearAutotileAssignments();
 
         auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0);
-        QCOMPARE(entry.mode, AssignmentEntry::Snapping);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Snapping);
         QCOMPARE(entry.snappingLayout, layout->id().toString());
         QCOMPARE(entry.tilingAlgorithm, QStringLiteral("wide"));
+    }
+
+    // Regression for the mode-only autotile cascade bug: the KCM stores
+    // mode=Autotile with empty tilingAlgorithm via setAssignmentEntryDirect
+    // to mean "autotile mode, use the default algorithm". Before the fix to
+    // LayoutId::makeAutotileId's empty-algorithm handling, activeLayoutId()
+    // returned empty for this entry — the cascade visitors in
+    // assignmentIdForScreen / assignmentEntryForScreen rejected it, and
+    // modeForScreen wrongly reported Snapping. Pin the correct behaviour so
+    // a future change to makeAutotileId doesn't silently regress the KCM
+    // mode-only workflow again.
+    void testAssignmentEntry_modeOnlyAutotile_cascadeAccepts()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+
+        PhosphorZones::AssignmentEntry modeOnly;
+        modeOnly.mode = PhosphorZones::AssignmentEntry::Autotile;
+        // snappingLayout + tilingAlgorithm both left empty — KCM wire format
+        // for "autotile, pick the default algorithm".
+        mgr->setAssignmentEntryDirect(QStringLiteral("DP-1"), 0, QString(), modeOnly);
+
+        // activeLayoutId() returns the bare prefix — non-empty, so the
+        // cascade visitor accepts it.
+        QCOMPARE(modeOnly.activeLayoutId(), QStringLiteral("autotile:"));
+        QVERIFY(!modeOnly.activeLayoutId().isEmpty());
+
+        // Both cascade paths must agree that this entry routes as Autotile.
+        QCOMPARE(mgr->modeForScreen(QStringLiteral("DP-1"), 0), PhosphorZones::AssignmentEntry::Autotile);
+        QCOMPARE(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 0), QStringLiteral("autotile:"));
+
+        auto roundTrip = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0);
+        QCOMPARE(roundTrip.mode, PhosphorZones::AssignmentEntry::Autotile);
+        QVERIFY(roundTrip.tilingAlgorithm.isEmpty());
+        QVERIFY(roundTrip.snappingLayout.isEmpty());
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -319,7 +420,7 @@ private Q_SLOTS:
 
     void testConfigRoundTrip_saveAndLoad_preservesAllFields()
     {
-        QScopedPointer<LayoutManager> mgr(createManager());
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
 
         auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
         mgr->addLayout(layoutA);
@@ -348,7 +449,8 @@ private Q_SLOTS:
         mgr->saveAssignments();
 
         // Create a new manager and load — same config file sees the data
-        QScopedPointer<LayoutManager> mgr2(new LayoutManager(nullptr));
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr2(new PhosphorZones::LayoutRegistry(
+            PlasmaZones::createAssignmentsBackend(), QStringLiteral("plasmazones/layouts")));
         mgr2->addLayout(createTestLayout(QStringLiteral("LayoutA")));
         mgr2->addLayout(createTestLayout(QStringLiteral("LayoutB")));
         QString layoutDir2 = m_guards.back()->dataPath() + QStringLiteral("/plasmazones/layouts2");
@@ -358,19 +460,19 @@ private Q_SLOTS:
 
         // Verify base screen
         auto base = mgr2->assignmentEntryForScreen(QStringLiteral("DP-1"), 0);
-        QCOMPARE(base.mode, AssignmentEntry::Autotile);
+        QCOMPARE(base.mode, PhosphorZones::AssignmentEntry::Autotile);
         QCOMPARE(base.snappingLayout, idA);
         QCOMPARE(base.tilingAlgorithm, QStringLiteral("wide"));
 
         // Verify per-desktop
         auto desk2 = mgr2->assignmentEntryForScreen(QStringLiteral("DP-1"), 2);
-        QCOMPARE(desk2.mode, AssignmentEntry::Snapping);
+        QCOMPARE(desk2.mode, PhosphorZones::AssignmentEntry::Snapping);
         QCOMPARE(desk2.snappingLayout, idB);
         QCOMPARE(desk2.tilingAlgorithm, QStringLiteral("dwindle"));
 
         // Verify per-activity
         auto act = mgr2->assignmentEntryForScreen(QStringLiteral("DP-1"), 0, QStringLiteral("act-123"));
-        QCOMPARE(act.mode, AssignmentEntry::Autotile);
+        QCOMPARE(act.mode, PhosphorZones::AssignmentEntry::Autotile);
         QCOMPARE(act.tilingAlgorithm, QStringLiteral("tall"));
 
         // Verify quick layout slot
@@ -378,114 +480,13 @@ private Q_SLOTS:
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // P6: Migration from old assignments.json with shadows
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    void testMigration_oldJsonWithShadows_mergesIntoAssignmentEntry()
-    {
-        QScopedPointer<LayoutManager> mgr(createManager());
-
-        auto* layout = createTestLayout(QStringLiteral("Manual"));
-        mgr->addLayout(layout);
-        QString layoutId = layout->id().toString();
-
-        // Write old-format assignments.json
-        QString layoutDir = m_guards.back()->dataPath() + QStringLiteral("/plasmazones/layouts");
-        QString jsonPath = layoutDir + QStringLiteral("/assignments.json");
-
-        QJsonObject root;
-        QJsonArray assignments;
-        {
-            // Active: autotile:wide on DP-1, desktop 0
-            QJsonObject obj;
-            obj[JsonKeys::ScreenId] = QStringLiteral("DP-1");
-            obj[JsonKeys::Desktop] = 0;
-            obj[JsonKeys::LayoutId] = QStringLiteral("autotile:wide");
-            assignments.append(obj);
-        }
-        root[JsonKeys::Assignments] = assignments;
-
-        // Shadow: the snapping layout that was active before toggling to autotile
-        QJsonArray shadows;
-        {
-            QJsonObject shadow;
-            shadow[JsonKeys::ScreenId] = QStringLiteral("DP-1");
-            shadow[JsonKeys::Desktop] = 0;
-            shadow[JsonKeys::LayoutId] = layoutId;
-            shadows.append(shadow);
-        }
-        root[QStringLiteral("shadowedAssignments")] = shadows;
-
-        QFile file(jsonPath);
-        QVERIFY(file.open(QIODevice::WriteOnly));
-        file.write(QJsonDocument(root).toJson());
-        file.close();
-
-        // Load — should migrate
-        mgr->loadAssignments();
-
-        auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0);
-        QCOMPARE(entry.mode, AssignmentEntry::Autotile);
-        QCOMPARE(entry.tilingAlgorithm, QStringLiteral("wide"));
-        // Shadow should be merged into snappingLayout field
-        QCOMPARE(entry.snappingLayout, layoutId);
-
-        // Old file should be renamed to .migrated
-        QVERIFY(!QFile::exists(jsonPath));
-        QVERIFY(QFile::exists(jsonPath + QStringLiteral(".migrated")));
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // P6: Migration from old [ModeTracking] config group
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    void testMigration_modeTrackingGroup_fillsMissingFields()
-    {
-        QScopedPointer<LayoutManager> mgr(createManager());
-
-        auto* layout = createTestLayout(QStringLiteral("Manual"));
-        mgr->addLayout(layout);
-        QString layoutId = layout->id().toString();
-
-        // Pre-populate config with an Assignment entry that has autotile but no snappingLayout
-        {
-            auto backend = PlasmaZones::createDefaultConfigBackend();
-            {
-                auto grp = backend->group(QStringLiteral("Assignment:DP-1"));
-                grp->writeInt(QStringLiteral("Mode"), 1); // Autotile
-                grp->writeString(QStringLiteral("TilingAlgorithm"), QStringLiteral("dwindle"));
-                // SnappingLayout intentionally empty
-            }
-            // Write old ModeTracking group with the manual layout ID
-            {
-                auto mt = backend->group(QStringLiteral("ModeTracking"));
-                mt->writeString(QStringLiteral("LastManualLayoutId"), layoutId);
-                mt->writeString(QStringLiteral("LastAutotileAlgorithm"), QStringLiteral("wide"));
-                mt->writeInt(QStringLiteral("LastTilingMode"), 1);
-            }
-            backend->sync();
-        }
-
-        mgr->loadAssignments();
-
-        auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0);
-        QCOMPARE(entry.mode, AssignmentEntry::Autotile);
-        QCOMPARE(entry.tilingAlgorithm, QStringLiteral("dwindle")); // Existing value preserved
-        QCOMPARE(entry.snappingLayout, layoutId); // Filled from ModeTracking
-
-        // ModeTracking group should be deleted
-        auto backend = PlasmaZones::createDefaultConfigBackend();
-        QVERIFY(!backend->groupList().contains(QStringLiteral("ModeTracking")));
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // P6: AssignmentEntry::fromLayoutId static factory
+    // P6: PhosphorZones::AssignmentEntry::fromLayoutId static factory
     // ═══════════════════════════════════════════════════════════════════════════
 
     void testAssignmentEntry_fromLayoutId_autotile()
     {
-        auto entry = AssignmentEntry::fromLayoutId(QStringLiteral("autotile:wide"));
-        QCOMPARE(entry.mode, AssignmentEntry::Autotile);
+        auto entry = PhosphorZones::AssignmentEntry::fromLayoutId(QStringLiteral("autotile:wide"));
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Autotile);
         QCOMPARE(entry.tilingAlgorithm, QStringLiteral("wide"));
         QVERIFY(entry.snappingLayout.isEmpty());
     }
@@ -493,19 +494,20 @@ private Q_SLOTS:
     void testAssignmentEntry_fromLayoutId_snapping()
     {
         QString uuid = QUuid::createUuid().toString();
-        auto entry = AssignmentEntry::fromLayoutId(uuid);
-        QCOMPARE(entry.mode, AssignmentEntry::Snapping);
+        auto entry = PhosphorZones::AssignmentEntry::fromLayoutId(uuid);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Snapping);
         QCOMPARE(entry.snappingLayout, uuid);
         QVERIFY(entry.tilingAlgorithm.isEmpty());
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // P7: LayoutAssignmentKey::fromGroupName parser
+    // P7: PhosphorZones::LayoutAssignmentKey::fromGroupName parser
     // ═══════════════════════════════════════════════════════════════════════════
 
     void testFromGroupName_fullKey_parsesAllFields()
     {
-        auto key = LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:eDP-1:Desktop:2:Activity:abc-123"));
+        auto key = PhosphorZones::LayoutAssignmentKey::fromGroupName(
+            QStringLiteral("Assignment:eDP-1:Desktop:2:Activity:abc-123"), QStringLiteral("Assignment:"));
         QCOMPARE(key.screenId, QStringLiteral("eDP-1"));
         QCOMPARE(key.virtualDesktop, 2);
         QCOMPARE(key.activity, QStringLiteral("abc-123"));
@@ -513,7 +515,8 @@ private Q_SLOTS:
 
     void testFromGroupName_screenOnly_parsesScreenId()
     {
-        auto key = LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:HDMI-A-1"));
+        auto key = PhosphorZones::LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:HDMI-A-1"),
+                                                                     QStringLiteral("Assignment:"));
         QCOMPARE(key.screenId, QStringLiteral("HDMI-A-1"));
         QCOMPARE(key.virtualDesktop, 0);
         QVERIFY(key.activity.isEmpty());
@@ -521,149 +524,761 @@ private Q_SLOTS:
 
     void testFromGroupName_noPrefix_returnsEmpty()
     {
-        auto key = LayoutAssignmentKey::fromGroupName(QStringLiteral("Snapping.Behavior"));
+        auto key = PhosphorZones::LayoutAssignmentKey::fromGroupName(QStringLiteral("Snapping.Behavior"),
+                                                                     QStringLiteral("Assignment:"));
         QVERIFY(key.screenId.isEmpty());
     }
 
     void testFromGroupName_emptyAfterPrefix_returnsEmpty()
     {
-        auto key = LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:"));
+        auto key = PhosphorZones::LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:"),
+                                                                     QStringLiteral("Assignment:"));
         QVERIFY(key.screenId.isEmpty());
     }
 
     void testFromGroupName_emptyActivity_treatedAsAllActivities()
     {
-        auto key = LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:eDP-1:Activity:"));
+        auto key = PhosphorZones::LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:eDP-1:Activity:"),
+                                                                     QStringLiteral("Assignment:"));
         QCOMPARE(key.screenId, QStringLiteral("eDP-1"));
         QVERIFY(key.activity.isEmpty());
     }
 
     void testFromGroupName_invalidDesktop_treatedAsAllDesktops()
     {
-        auto key = LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:eDP-1:Desktop:abc"));
+        auto key = PhosphorZones::LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:eDP-1:Desktop:abc"),
+                                                                     QStringLiteral("Assignment:"));
         QCOMPARE(key.screenId, QStringLiteral("eDP-1"));
         QCOMPARE(key.virtualDesktop, 0);
     }
 
     void testFromGroupName_negativeDesktop_treatedAsAllDesktops()
     {
-        auto key = LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:eDP-1:Desktop:-1"));
+        auto key = PhosphorZones::LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:eDP-1:Desktop:-1"),
+                                                                     QStringLiteral("Assignment:"));
         QCOMPARE(key.screenId, QStringLiteral("eDP-1"));
         QCOMPARE(key.virtualDesktop, 0);
     }
 
     void testFromGroupName_zeroDesktop_treatedAsAllDesktops()
     {
-        auto key = LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:eDP-1:Desktop:0"));
+        auto key = PhosphorZones::LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:eDP-1:Desktop:0"),
+                                                                     QStringLiteral("Assignment:"));
         QCOMPARE(key.screenId, QStringLiteral("eDP-1"));
         QCOMPARE(key.virtualDesktop, 0);
     }
 
     void testFromGroupName_desktopOnly_parsesDesktop()
     {
-        auto key = LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:DP-2:Desktop:3"));
+        auto key = PhosphorZones::LayoutAssignmentKey::fromGroupName(QStringLiteral("Assignment:DP-2:Desktop:3"),
+                                                                     QStringLiteral("Assignment:"));
         QCOMPARE(key.screenId, QStringLiteral("DP-2"));
         QCOMPARE(key.virtualDesktop, 3);
         QVERIFY(key.activity.isEmpty());
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Level-1 cascade default — symmetric snap + autotile providers (issue #368)
+    //
+    // The level-1 (global) tier of the assignment hierarchy is two pass-through
+    // providers: setDefaultLayoutIdProvider (snap UUID) and
+    // setDefaultAutotileAlgorithmProvider (autotile algorithm). Composition
+    // roots gate each on its own enabled flag; the library decides precedence
+    // (snap > autotile) so the daemon stays free of mode-priority logic. Pin
+    // the four enabled-flag combinations and the cascade-takes-precedence rule.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    void testLevel1Default_autotileOnly_synthesizesAutotile()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        // Snap disabled (provider returns empty), autotile provider returns
+        // an algorithm — the cascade should resolve autotile.
+        mgr->setDefaultLayoutIdProvider([]() {
+            return QString();
+        });
+        mgr->setDefaultAutotileAlgorithmProvider([]() {
+            return QStringLiteral("bsp");
+        });
+
+        const auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 4);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Autotile);
+        QCOMPARE(entry.tilingAlgorithm, QStringLiteral("bsp"));
+        QCOMPARE(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4), QStringLiteral("autotile:bsp"));
+    }
+
+    void testLevel1Default_snapOnly_synthesizesSnap()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layout = createTestLayout(QStringLiteral("Snap"));
+        mgr->addLayout(layout);
+
+        const QString layoutId = layout->id().toString();
+        mgr->setDefaultLayoutIdProvider([layoutId]() {
+            return layoutId;
+        });
+        mgr->setDefaultAutotileAlgorithmProvider([]() {
+            return QString();
+        });
+
+        const auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 4);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Snapping);
+        QCOMPARE(entry.snappingLayout, layoutId);
+        QCOMPARE(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4), layoutId);
+        QCOMPARE(mgr->layoutForScreen(QStringLiteral("DP-1"), 4), layout);
+    }
+
+    void testLevel1Default_bothEmpty_returnsNoEntry()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        // Both providers return empty — neither snap nor autotile is the
+        // user's active default. Cascade should treat as "no assignment".
+        mgr->setDefaultLayoutIdProvider([]() {
+            return QString();
+        });
+        mgr->setDefaultAutotileAlgorithmProvider([]() {
+            return QString();
+        });
+
+        QVERIFY(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4).isEmpty());
+        const auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 4);
+        QVERIFY(!entry.isValid());
+    }
+
+    void testLevel1Default_bothSet_snapWinsByLibraryPrecedence()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layout = createTestLayout(QStringLiteral("Snap"));
+        mgr->addLayout(layout);
+
+        const QString layoutId = layout->id().toString();
+        // Both providers return non-empty — library precedence picks snap.
+        // Composition roots that wire both provider lambdas without
+        // gating on enabled flags will see snap consistently.
+        mgr->setDefaultLayoutIdProvider([layoutId]() {
+            return layoutId;
+        });
+        mgr->setDefaultAutotileAlgorithmProvider([]() {
+            return QStringLiteral("bsp");
+        });
+
+        const auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 4);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Snapping);
+        QCOMPARE(entry.snappingLayout, layoutId);
+        QCOMPARE(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4), layoutId);
+    }
+
+    void testLevel1Default_storedEntryTakesPrecedence()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layout = createTestLayout(QStringLiteral("PerDesktop"));
+        mgr->addLayout(layout);
+
+        // Autotile is the global default, but desktop 1 has an explicit
+        // snap assignment — explicit cascade entries always win.
+        mgr->setDefaultAutotileAlgorithmProvider([]() {
+            return QStringLiteral("bsp");
+        });
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QString(), layout);
+
+        const auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 1);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Snapping);
+        QCOMPARE(entry.snappingLayout, layout->id().toString());
+
+        // Other desktops still get the synthesized autotile default.
+        const auto desk2 = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 2);
+        QCOMPARE(desk2.mode, PhosphorZones::AssignmentEntry::Autotile);
+        QCOMPARE(desk2.tilingAlgorithm, QStringLiteral("bsp"));
+    }
+
+    void testLevel1Default_noProviders_preservesPre368Behaviour()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        // No providers set at all — cascade miss returns default-constructed
+        // entry, matching the historical behaviour callers rely on.
+        QVERIFY(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4).isEmpty());
+        const auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 4);
+        QVERIFY(!entry.isValid());
+    }
+
+    void testLevel1Default_snapWithUnknownUuid_layoutForScreenFallsThrough()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* registered = createTestLayout(QStringLiteral("Registered"));
+        mgr->addLayout(registered);
+
+        // Snap provider returns a UUID that's NOT in the registry — a stale
+        // defaultLayoutId from settings. layoutForScreen must still resolve
+        // to a real Layout* (defaultLayout falls back to first by defaultOrder).
+        const QString bogusId = QUuid::createUuid().toString();
+        mgr->setDefaultLayoutIdProvider([bogusId]() {
+            return bogusId;
+        });
+
+        // assignmentIdForScreen surfaces the raw stored string — KCM/UI
+        // can warn or clear it.
+        QCOMPARE(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4), bogusId);
+        QCOMPARE(mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 4).snappingLayout, bogusId);
+        // layoutForScreen must not return nullptr.
+        QCOMPARE(mgr->layoutForScreen(QStringLiteral("DP-1"), 4), registered);
+    }
+
+    void testLevel1Default_autotileWithEmptyAlgorithm_treatedAsNoAutotile()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        // Provider returns empty algorithm — composition root would only
+        // do this if autotile is disabled, so the cascade should treat as
+        // "no level-1 autotile default" and fall through to no entry.
+        mgr->setDefaultAutotileAlgorithmProvider([]() {
+            return QString();
+        });
+
+        QVERIFY(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4).isEmpty());
+        QVERIFY(!mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 4).isValid());
+    }
+
+    void testLevel1Default_cascadeHitSkipsProviders()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layout = createTestLayout(QStringLiteral("Stored"));
+        mgr->addLayout(layout);
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QString(), layout);
+
+        auto snapCalls = std::make_shared<int>(0);
+        auto autoCalls = std::make_shared<int>(0);
+        mgr->setDefaultLayoutIdProvider([snapCalls]() {
+            ++(*snapCalls);
+            return QString(); // empty so autotile would be consulted
+        });
+        mgr->setDefaultAutotileAlgorithmProvider([autoCalls]() {
+            ++(*autoCalls);
+            return QStringLiteral("bsp");
+        });
+
+        // Exact-key cascade hit — neither provider should be invoked.
+        const auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 1);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Snapping);
+        QCOMPARE(*snapCalls, 0);
+        QCOMPARE(*autoCalls, 0);
+
+        QCOMPARE(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 1), layout->id().toString());
+        QCOMPARE(*snapCalls, 0);
+        QCOMPARE(*autoCalls, 0);
+
+        QCOMPARE(mgr->layoutForScreen(QStringLiteral("DP-1"), 1), layout);
+        QCOMPARE(*snapCalls, 0);
+        QCOMPARE(*autoCalls, 0);
+
+        // Cascade miss on a different desktop — both providers consulted in
+        // priority order: snap first (returns empty), then autotile (wins).
+        (void)mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 2);
+        QCOMPARE(*snapCalls, 1);
+        QCOMPARE(*autoCalls, 1);
+    }
+
+    void testLevel1Default_replaceProviderReplacesBehaviour()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        mgr->setDefaultAutotileAlgorithmProvider([]() {
+            return QStringLiteral("bsp");
+        });
+        QCOMPARE(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4), QStringLiteral("autotile:bsp"));
+
+        // Replace — second value wins, not stacks.
+        mgr->setDefaultAutotileAlgorithmProvider([]() {
+            return QStringLiteral("dwindle");
+        });
+        QCOMPARE(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4), QStringLiteral("autotile:dwindle"));
+
+        // Clearing restores pre-368 cascade behaviour.
+        mgr->setDefaultAutotileAlgorithmProvider({});
+        QVERIFY(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4).isEmpty());
+    }
+
+    // The daemon's snap provider returns m_settings->defaultLayoutId() directly
+    // when snappingEnabled is true. If defaultLayoutId() is empty (e.g. a
+    // user has snap on but never picked a default layout), the snap provider
+    // returns empty and the cascade falls through to the autotile branch. The
+    // user explicitly enabled snap, but they get autotile on unconfigured
+    // contexts. This pins that behaviour so anyone changing it has to
+    // explicitly decide whether the silent mode-swap is desirable; a future
+    // tightening (snap mode with empty layout treated as a sentinel "snap, no
+    // zones") would update this expectation.
+    void testLevel1Default_snapEnabledEmptyId_autotileEnabled_autotileWins()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        mgr->setDefaultLayoutIdProvider([]() {
+            return QString();
+        });
+        mgr->setDefaultAutotileAlgorithmProvider([]() {
+            return QStringLiteral("bsp");
+        });
+
+        const auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 4);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Autotile);
+        QCOMPARE(entry.tilingAlgorithm, QStringLiteral("bsp"));
+        QCOMPARE(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 4), QStringLiteral("autotile:bsp"));
+    }
+
+    // Cascade level-2 (per-screen base entry, key = (screen, 0, "")) must
+    // hide level-1 providers. Without this, a per-screen base assignment
+    // would be silently shadowed by the user's global default whenever the
+    // queried desktop didn't have its own explicit entry. Companion to
+    // testLevel1Default_cascadeHitSkipsProviders, which covers the level-3
+    // exact-key case; this one covers the more interesting level-2 case.
+    void testLevel1Default_perScreenBaseEntryHidesProviders()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* baseLayout = createTestLayout(QStringLiteral("PerScreenBase"));
+        mgr->addLayout(baseLayout);
+
+        // Per-screen base entry on DP-1 (no per-desktop entries).
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), baseLayout);
+
+        // Both providers wired with non-empty values that would otherwise
+        // win at level-1 if the cascade missed.
+        auto snapCalls = std::make_shared<int>(0);
+        auto autoCalls = std::make_shared<int>(0);
+        mgr->setDefaultLayoutIdProvider([snapCalls]() {
+            ++(*snapCalls);
+            return QStringLiteral("{ffffffff-ffff-ffff-ffff-ffffffffffff}");
+        });
+        mgr->setDefaultAutotileAlgorithmProvider([autoCalls]() {
+            ++(*autoCalls);
+            return QStringLiteral("bsp");
+        });
+
+        // Querying any desktop on DP-1 should resolve to the per-screen
+        // base entry — the cascade hits at level-2 and providers are not
+        // consulted. Pinning the call counter at 0 catches future
+        // refactors that would re-order resolution.
+        const auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 5);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Snapping);
+        QCOMPARE(entry.snappingLayout, baseLayout->id().toString());
+        QCOMPARE(*snapCalls, 0);
+        QCOMPARE(*autoCalls, 0);
+
+        // Same query via the id-only and Layout* paths, same expectation.
+        QCOMPARE(mgr->assignmentIdForScreen(QStringLiteral("DP-1"), 5), baseLayout->id().toString());
+        QCOMPARE(mgr->layoutForScreen(QStringLiteral("DP-1"), 5), baseLayout);
+        QCOMPARE(*snapCalls, 0);
+        QCOMPARE(*autoCalls, 0);
+
+        // A different screen with no entry DOES fall through to providers.
+        (void)mgr->assignmentEntryForScreen(QStringLiteral("HDMI-2"), 5);
+        QCOMPARE(*snapCalls, 1);
+        // Snap provider returned non-empty (bogus uuid), so autotile not consulted.
+        QCOMPARE(*autoCalls, 0);
+    }
+
+    // hasExplicitAssignment must distinguish "stored" from "synthesized
+    // fallback". This is the building block consumers like the D-Bus
+    // getAllScreenAssignments JSON readback rely on to avoid round-tripping
+    // the synthesized default back into stored state (which would shadow
+    // future global-default changes). The KCM JSON gate added in
+    // src/dbus/layoutadaptor/assignment.cpp is correct only as long as
+    // this invariant holds — pin it here so a future refactor that
+    // accidentally makes hasExplicitAssignment provider-aware would fail
+    // this test.
+    void testLevel1Default_hasExplicitAssignmentIgnoresSynth()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        mgr->setDefaultAutotileAlgorithmProvider([]() {
+            return QStringLiteral("bsp");
+        });
+
+        // Cascade miss returns a synthesized entry…
+        const auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0);
+        QVERIFY(entry.isValid());
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Autotile);
+
+        // …but hasExplicitAssignment correctly reports "no stored entry".
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QString()));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 5, QString()));
+
+        // After an explicit assignment, hasExplicitAssignment flips true
+        // for that exact key only.
+        auto* layout = createTestLayout(QStringLiteral("Stored"));
+        mgr->addLayout(layout);
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QString(), layout);
+
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 1, QString()));
+        // Sibling desktop is still synth-only, not explicit.
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 2, QString()));
+        // Different screen is also still synth-only.
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("HDMI-2"), 1, QString()));
+    }
+
     void testAssignmentEntry_fromLayoutId_setsModeSetsField_preservesOther()
     {
-        AssignmentEntry existing;
-        existing.mode = AssignmentEntry::Autotile;
+        PhosphorZones::AssignmentEntry existing;
+        existing.mode = PhosphorZones::AssignmentEntry::Autotile;
         existing.tilingAlgorithm = QStringLiteral("dwindle");
         existing.snappingLayout = QStringLiteral("{some-uuid}");
 
         // Update snapping field — mode switches to Snapping, tiling preserved
-        auto entry = AssignmentEntry::fromLayoutId(QStringLiteral("{new-uuid}"), existing);
-        QCOMPARE(entry.mode, AssignmentEntry::Snapping);
+        auto entry = PhosphorZones::AssignmentEntry::fromLayoutId(QStringLiteral("{new-uuid}"), existing);
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Snapping);
         QCOMPARE(entry.snappingLayout, QStringLiteral("{new-uuid}"));
         QCOMPARE(entry.tilingAlgorithm, QStringLiteral("dwindle")); // preserved
 
         // Update tiling field — mode switches to Autotile, snapping preserved
-        auto entry2 = AssignmentEntry::fromLayoutId(QStringLiteral("autotile:wide"), existing);
-        QCOMPARE(entry2.mode, AssignmentEntry::Autotile);
+        auto entry2 = PhosphorZones::AssignmentEntry::fromLayoutId(QStringLiteral("autotile:wide"), existing);
+        QCOMPARE(entry2.mode, PhosphorZones::AssignmentEntry::Autotile);
         QCOMPARE(entry2.tilingAlgorithm, QStringLiteral("wide"));
         QCOMPARE(entry2.snappingLayout, QStringLiteral("{some-uuid}")); // preserved
     }
-
     // ═══════════════════════════════════════════════════════════════════════════
-    // P8: Runtime config.json → assignments.json migration
+    // PR #501: partial-update / promote semantics
     // ═══════════════════════════════════════════════════════════════════════════
 
-    void testLoadAssignments_migratesFromConfigJson()
+    // PreservingMode on a slot with NO existing entry: seeds from the cascade
+    // (display default) and writes the new snap, keeping mode + opposite field.
+    void testSetSnappingLayoutPreservingMode_noEntry_seedsFromCascade()
     {
-        // createManager() pushes its own IsolatedConfigGuard, so config.json
-        // must be written AFTER the manager's guard is active to share the
-        // same XDG_CONFIG_HOME.
-        auto* mgr = createManager();
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+        auto* layoutB = createTestLayout(QStringLiteral("LayoutB"));
+        mgr->addLayout(layoutB);
 
-        // Write Assignment:* and QuickLayouts groups to config.json (simulating
-        // a user who was already on v2 before the assignments split).
-        {
-            auto configBackend = PlasmaZones::createDefaultConfigBackend();
-            {
-                auto g = configBackend->group(QStringLiteral("Assignment:eDP-1"));
-                g->writeInt(QLatin1String("Mode"), 0);
-                g->writeString(QLatin1String("SnappingLayout"), QStringLiteral("{aaaa-bbbb}"));
-                g->writeString(QLatin1String("TilingAlgorithm"), QStringLiteral("dwindle"));
-            }
-            {
-                auto g = configBackend->group(QStringLiteral("Assignment:HDMI-A-1:Desktop:2"));
-                g->writeInt(QLatin1String("Mode"), 1);
-                g->writeString(QLatin1String("SnappingLayout"), QStringLiteral("{cccc-dddd}"));
-                g->writeString(QLatin1String("TilingAlgorithm"), QStringLiteral("bsp"));
-            }
-            {
-                auto g = configBackend->group(ConfigDefaults::quickLayoutsGroup());
-                g->writeString(QStringLiteral("1"), QStringLiteral("{quick-1}"));
-            }
-            configBackend->sync();
-        }
+        // Set a base entry on the screen so the cascade resolves to something.
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layoutA);
 
-        // Ensure assignments.json is still empty
-        {
-            auto assignBackend = PlasmaZones::createAssignmentsBackend();
-            QVERIFY(assignBackend->groupList().isEmpty());
-        }
+        // Now write a per-desktop snap preference. Slot (DP-1, vd=3, "") has
+        // no local entry; seed should come from the screen-only cascade.
+        mgr->setSnappingLayoutPreservingMode(QStringLiteral("DP-1"), 3, QString(), layoutB->id().toString());
 
-        // loadAssignments() should detect empty assignments.json and migrate
-        // from config.json.
-        mgr->loadAssignments();
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 3, QString()));
+        auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 3, QString());
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Snapping);
+        QCOMPARE(entry.snappingLayout, layoutB->id().toString());
+    }
 
-        // Verify assignments were loaded
-        auto entry1 = mgr->assignmentEntryForScreen(QStringLiteral("eDP-1"));
-        QCOMPARE(entry1.mode, AssignmentEntry::Snapping);
-        QCOMPARE(entry1.snappingLayout, QStringLiteral("{aaaa-bbbb}"));
-        QCOMPARE(entry1.tilingAlgorithm, QStringLiteral("dwindle"));
+    // PR #501 regression: when the slot has a local entry whose
+    // activeLayoutId() happens to be empty (e.g. {mode=Snapping, snap="",
+    // tile="cluster"}), a partial snap update must NOT cascade-seed and
+    // drop the locally-stored opposite-field value. seedForPartialUpdate
+    // used to gate on `!activeLayoutId().isEmpty()` and clobber the tile.
+    void testSetSnappingLayoutPreservingMode_preservesLocalOppositeFieldWhenActiveIdEmpty()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+        auto* layoutB = createTestLayout(QStringLiteral("LayoutB"));
+        mgr->addLayout(layoutB);
 
-        auto entry2 = mgr->assignmentEntryForScreen(QStringLiteral("HDMI-A-1"), 2);
-        QCOMPARE(entry2.mode, AssignmentEntry::Autotile);
-        QCOMPARE(entry2.tilingAlgorithm, QStringLiteral("bsp"));
+        // Seed a different cascade winner at a higher level (per-desktop)
+        // so that if seedForPartialUpdate falls back to the cascade it
+        // would pick this entry up.
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QString(), layoutA);
 
-        // Quick layout slot should have migrated
-        QCOMPARE(mgr->quickLayoutSlots().value(1), QStringLiteral("{quick-1}"));
+        // Place a local entry at (DP-1, 0, "") that has mode=Snapping but
+        // empty snap (only a tile preference). activeLayoutId() == "".
+        PhosphorZones::AssignmentEntry tileOnly;
+        tileOnly.mode = PhosphorZones::AssignmentEntry::Snapping;
+        tileOnly.snappingLayout = QString();
+        tileOnly.tilingAlgorithm = QStringLiteral("cluster");
+        mgr->setAssignmentEntryDirect(QStringLiteral("DP-1"), 0, QString(), tileOnly);
 
-        // Verify assignments.json was written (persisted by migration)
-        {
-            auto assignBackend = PlasmaZones::createAssignmentsBackend();
-            QStringList groups = assignBackend->groupList();
-            QVERIFY(groups.contains(QStringLiteral("Assignment:eDP-1")));
-            QVERIFY(groups.contains(QStringLiteral("Assignment:HDMI-A-1:Desktop:2")));
-        }
+        // Partial snap update at THIS slot — must preserve local tile,
+        // not pick up cascade winner's data.
+        mgr->setSnappingLayoutPreservingMode(QStringLiteral("DP-1"), 0, QString(), layoutB->id().toString());
 
-        // Verify config.json no longer has the migrated groups
-        {
-            auto configBackend = PlasmaZones::createDefaultConfigBackend();
-            QStringList groups = configBackend->groupList();
-            for (const QString& g : groups) {
-                QVERIFY2(!g.startsWith(ConfigDefaults::assignmentGroupPrefix()),
-                         qPrintable(
-                             QStringLiteral("Assignment group '%1' should have been removed from config.json").arg(g)));
-            }
-            QVERIFY2(!groups.contains(ConfigDefaults::quickLayoutsGroup()),
-                     "QuickLayouts should have been removed from config.json");
-        }
+        auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0, QString());
+        QCOMPARE(entry.snappingLayout, layoutB->id().toString());
+        QCOMPARE(entry.tilingAlgorithm, QStringLiteral("cluster")); // preserved!
+    }
+
+    // PreservingMode with empty layoutId removes the entry when both
+    // fields end up empty, and leaves OTHER entries on the screen alone.
+    void testSetSnappingLayoutPreservingMode_emptyClear_removesOnlyTargetSlot()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+        auto* layoutB = createTestLayout(QStringLiteral("LayoutB"));
+        mgr->addLayout(layoutB);
+
+        // Per-desktop entry the user cares about — must survive a
+        // monitor-row clear.
+        mgr->assignLayout(QStringLiteral("DP-1"), 2, QString(), layoutA);
+        // Monitor-row entry (snap-only) — target of the clear.
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layoutB);
+
+        mgr->setSnappingLayoutPreservingMode(QStringLiteral("DP-1"), 0, QString(), QString());
+
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QString()));
+        // Per-desktop entry MUST still be present (this is the regression
+        // for the destructive-clear bug — promote would have wiped it).
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 2, QString()));
+        auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 2, QString());
+        QCOMPARE(entry.snappingLayout, layoutA->id().toString());
+    }
+
+    // Promoting on the Monitor row (vd=0, activity="") wipes ALL other
+    // entries on the screen (and its VS variants) — this is intentional,
+    // it's the cascade-winner promotion semantics. Pin behavior so the
+    // shadow-clear rule doesn't regress.
+    void testSetSnappingLayoutPromoting_monitorRow_wipesAllShadows()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+        auto* layoutB = createTestLayout(QStringLiteral("LayoutB"));
+        mgr->addLayout(layoutB);
+        auto* layoutC = createTestLayout(QStringLiteral("LayoutC"));
+        mgr->addLayout(layoutC);
+
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QString(), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QStringLiteral("activity-x"), layoutB);
+        mgr->assignLayout(QStringLiteral("DP-1"), 3, QStringLiteral("activity-y"), layoutC);
+
+        mgr->setSnappingLayoutPromoting(QStringLiteral("DP-1"), 0, QString(), layoutA->id().toString());
+
+        // The target slot is set + every shadow on the same screen gone.
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QString()));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 1, QString()));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QStringLiteral("activity-x")));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 3, QStringLiteral("activity-y")));
+    }
+
+    // Promoting on a per-desktop slot (vd>0, activity="") wipes BOTH
+    // same-desktop shadows AND per-activity shadows. Per-activity entries
+    // (vd=0, activity!="") shadow the per-desktop slot at cascade L2 for
+    // any context with a matching activity — leaving them intact would
+    // let the activity-keyed entry continue to win whenever that
+    // activity is current.
+    void testSetSnappingLayoutPromoting_perDesktop_wipesSameDesktopAndPerActivityShadows()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+        auto* layoutB = createTestLayout(QStringLiteral("LayoutB"));
+        mgr->addLayout(layoutB);
+        auto* layoutC = createTestLayout(QStringLiteral("LayoutC"));
+        mgr->addLayout(layoutC);
+
+        // Screen-level — must survive.
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layoutA);
+        // Another desktop — must survive.
+        mgr->assignLayout(QStringLiteral("DP-1"), 2, QString(), layoutB);
+        // Same desktop + activity — shadows the target at L1, must be wiped.
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QStringLiteral("activity-x"), layoutC);
+        // Per-activity (vd=0, activity-y) — shadows the target at L2 for
+        // any context with activity-y, must be wiped.
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QStringLiteral("activity-y"), layoutC);
+        // Different desktop + activity — does NOT shadow (different desktop),
+        // must survive.
+        mgr->assignLayout(QStringLiteral("DP-1"), 2, QStringLiteral("activity-z"), layoutC);
+
+        mgr->setSnappingLayoutPromoting(QStringLiteral("DP-1"), 1, QString(), layoutA->id().toString());
+
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QString()));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 2, QString()));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 1, QStringLiteral("activity-x")));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QStringLiteral("activity-y")));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 2, QStringLiteral("activity-z")));
+    }
+
+    // Promoting on a per-activity slot (vd=0, activity!="") only wipes
+    // entries with the same activity.
+    void testSetSnappingLayoutPromoting_perActivity_wipesOnlySameActivityShadows()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+        auto* layoutB = createTestLayout(QStringLiteral("LayoutB"));
+        mgr->addLayout(layoutB);
+        auto* layoutC = createTestLayout(QStringLiteral("LayoutC"));
+        mgr->addLayout(layoutC);
+
+        // Screen-level — must survive.
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layoutA);
+        // Per-desktop, no activity — must survive.
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QString(), layoutB);
+        // Same activity, any desktop — shadows the target, must be wiped.
+        mgr->assignLayout(QStringLiteral("DP-1"), 2, QStringLiteral("activity-x"), layoutC);
+        // Different activity — must survive.
+        mgr->assignLayout(QStringLiteral("DP-1"), 3, QStringLiteral("activity-y"), layoutC);
+
+        mgr->setSnappingLayoutPromoting(QStringLiteral("DP-1"), 0, QStringLiteral("activity-x"),
+                                        layoutA->id().toString());
+
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QString()));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 1, QString()));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 2, QStringLiteral("activity-x")));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 3, QStringLiteral("activity-y")));
+    }
+
+    // Promoting on a fully-specific slot (vd>0, activity!="") doesn't wipe
+    // anything — no other entry can shadow it in the cascade. AND the
+    // target slot itself receives the new value.
+    void testSetSnappingLayoutPromoting_specificSlot_writesTargetAndPreservesOthers()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+        auto* layoutB = createTestLayout(QStringLiteral("LayoutB"));
+        mgr->addLayout(layoutB);
+
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QString(), layoutB);
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QStringLiteral("activity-x"), layoutB);
+
+        mgr->setSnappingLayoutPromoting(QStringLiteral("DP-1"), 1, QStringLiteral("activity-x"),
+                                        layoutA->id().toString());
+
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QString()));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 1, QString()));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QStringLiteral("activity-x")));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 1, QStringLiteral("activity-x")));
+        // Target slot itself MUST hold the new layout id — a regression
+        // that wiped shadows but failed to write the target would still
+        // pass the four hasExplicitAssignment checks above.
+        const auto target = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 1, QStringLiteral("activity-x"));
+        QCOMPARE(target.mode, PhosphorZones::AssignmentEntry::Snapping);
+        QCOMPARE(target.snappingLayout, layoutA->id().toString());
+    }
+
+    // Tile-promoting forces mode=Autotile and writes the tile field.
+    void testSetTilingAlgorithmPromoting_forcesAutotileMode()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layoutA);
+
+        mgr->setTilingAlgorithmPromoting(QStringLiteral("DP-1"), 0, QString(), QStringLiteral("cluster"));
+
+        auto entry = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0, QString());
+        QCOMPARE(entry.mode, PhosphorZones::AssignmentEntry::Autotile);
+        QCOMPARE(entry.tilingAlgorithm, QStringLiteral("cluster"));
+        QCOMPARE(entry.snappingLayout, layoutA->id().toString()); // preserved
+    }
+
+    // Symmetric tile-promote shadow-clear tests (snap had 4 promote
+    // shape tests; tile only had the mode-flip test). Pin behavior so
+    // a tile-side regression doesn't silently slip through.
+    void testSetTilingAlgorithmPromoting_monitorRow_wipesAllShadows()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QString(), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QStringLiteral("activity-x"), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 3, QStringLiteral("activity-y"), layoutA);
+
+        mgr->setTilingAlgorithmPromoting(QStringLiteral("DP-1"), 0, QString(), QStringLiteral("cluster"));
+
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QString()));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 1, QString()));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QStringLiteral("activity-x")));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 3, QStringLiteral("activity-y")));
+        // Target slot holds the new algo.
+        const auto target = mgr->assignmentEntryForScreen(QStringLiteral("DP-1"), 0, QString());
+        QCOMPARE(target.mode, PhosphorZones::AssignmentEntry::Autotile);
+        QCOMPARE(target.tilingAlgorithm, QStringLiteral("cluster"));
+    }
+
+    void testSetTilingAlgorithmPromoting_perDesktop_wipesSameDesktopAndPerActivityShadows()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 2, QString(), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QStringLiteral("activity-x"), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QStringLiteral("activity-y"), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 2, QStringLiteral("activity-z"), layoutA);
+
+        mgr->setTilingAlgorithmPromoting(QStringLiteral("DP-1"), 1, QString(), QStringLiteral("cluster"));
+
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QString()));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 2, QString()));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 1, QStringLiteral("activity-x")));
+        // Per-activity entry (vd=0, activity-y) shadows the promoted
+        // per-desktop slot for any context with activity-y → wiped.
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QStringLiteral("activity-y")));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 2, QStringLiteral("activity-z")));
+    }
+
+    void testSetTilingAlgorithmPromoting_perActivity_wipesOnlySameActivityShadows()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+
+        mgr->assignLayout(QStringLiteral("DP-1"), 0, QString(), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 1, QString(), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 2, QStringLiteral("activity-x"), layoutA);
+        mgr->assignLayout(QStringLiteral("DP-1"), 3, QStringLiteral("activity-y"), layoutA);
+
+        mgr->setTilingAlgorithmPromoting(QStringLiteral("DP-1"), 0, QStringLiteral("activity-x"),
+                                         QStringLiteral("cluster"));
+
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QString()));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 1, QString()));
+        QVERIFY(!mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 2, QStringLiteral("activity-x")));
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 3, QStringLiteral("activity-y")));
+    }
+
+    // VS-variant cleanup: promoting on a physical-screen slot must
+    // also wipe any per-VS assignment that would re-shadow it via the
+    // cascade's VS→physical fallback (level 6 in walkCascade).
+    void testSetSnappingLayoutPromoting_monitorRow_wipesVirtualScreenVariants()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+        auto* layoutB = createTestLayout(QStringLiteral("LayoutB"));
+        mgr->addLayout(layoutB);
+
+        const QString physId = QStringLiteral("DP-1");
+        // VS id format: "<physId>/vs:<index>" — see PhosphorIdentity::VirtualScreenId.
+        const QString vsId = physId + QStringLiteral("/vs:0");
+        mgr->assignLayout(vsId, 0, QString(), layoutB);
+
+        mgr->setSnappingLayoutPromoting(physId, 0, QString(), layoutA->id().toString());
+
+        // Physical slot was written.
+        QVERIFY(mgr->hasExplicitAssignment(physId, 0, QString()));
+        // VS-variant was wiped — would otherwise re-shadow the physical
+        // when the cascade walks VS→physical at level 6.
+        QVERIFY(!mgr->hasExplicitAssignment(vsId, 0, QString()));
+    }
+
+    // Regression for the "remove only when BOTH fields end up empty"
+    // semantic in applyPartialOrPromote: clearing the snap field on an
+    // entry whose tile field is non-empty MUST keep the entry around
+    // (with snap="" and the existing tile intact).
+    void testSetSnappingLayoutPreservingMode_clearSnapKeepsEntryWhenTileNonEmpty()
+    {
+        QScopedPointer<PhosphorZones::LayoutRegistry> mgr(createManager());
+        auto* layoutA = createTestLayout(QStringLiteral("LayoutA"));
+        mgr->addLayout(layoutA);
+
+        // Existing entry has both fields set, mode=Snapping.
+        PhosphorZones::AssignmentEntry both;
+        both.mode = PhosphorZones::AssignmentEntry::Snapping;
+        both.snappingLayout = layoutA->id().toString();
+        both.tilingAlgorithm = QStringLiteral("cluster");
+        mgr->setAssignmentEntryDirect(QStringLiteral("DP-1"), 0, QString(), both);
+
+        // Clear the snap field — tile must remain.
+        mgr->setSnappingLayoutPreservingMode(QStringLiteral("DP-1"), 0, QString(), QString());
+
+        // Entry record still exists.
+        QVERIFY(mgr->hasExplicitAssignment(QStringLiteral("DP-1"), 0, QString()));
+        // Per-field readers see the cleared snap and the preserved tile.
+        // (assignmentEntryForScreen rejects entries with empty
+        // activeLayoutId() via its cascade visitor and would fall through
+        // to a synthesized default — that's pre-PR behavior; use the
+        // per-field accessors instead to verify the actual stored state.)
+        QCOMPARE(mgr->snappingLayoutForScreen(QStringLiteral("DP-1"), 0, QString()), QString());
+        QCOMPARE(mgr->tilingAlgorithmForScreen(QStringLiteral("DP-1"), 0, QString()), QStringLiteral("cluster"));
     }
 };
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # SPDX-FileCopyrightText: 2026 fuddlesworth
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
@@ -12,7 +12,7 @@
 # but we also include the raw files (config.json, session.json, data/) so that
 # triagers can inspect exact JSON without re-serialization artefacts.
 #
-# Requires: plasmazonesd running, qdbus6 or busctl, perl (with JSON::PP for busctl)
+# Requires: plasmazonesd running, busctl (or qdbus6/qdbus), perl (with JSON::PP for busctl)
 
 set -euo pipefail
 
@@ -53,6 +53,7 @@ while [[ $# -gt 0 ]]; do
             echo "  session.json     Window session state (home paths redacted)"
             echo "  data/            User data (layouts, algorithms, shaders, etc.)"
             echo "  journal.log      Recent plasmazonesd journal entries"
+            echo "  kwin-effect.log  Recent PlasmaZones KWin effect journal entries"
             exit 0
             ;;
         *)
@@ -73,11 +74,13 @@ OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 # ─── D-Bus call ───────────────────────────────────────────────────────────────
 
 call_dbus() {
-    if command -v qdbus6 &>/dev/null; then
-        qdbus6 org.plasmazones /PlasmaZones org.plasmazones.Control.generateSupportReport "$SINCE_MINUTES"
-    elif command -v qdbus &>/dev/null; then
-        qdbus org.plasmazones /PlasmaZones org.plasmazones.Control.generateSupportReport "$SINCE_MINUTES"
-    elif command -v busctl &>/dev/null; then
+    # Prefer busctl: qttools' `qdbus`/`qdbus6` segfaults at process exit on
+    # Qt 6.11+ (static-destruction-order crash in registerComplexDBusType ->
+    # QMetaType::unregisterMetaType) whenever it introspects an object that
+    # exposes complex D-Bus types — which /PlasmaZones does. That crash can
+    # discard buffered stdout, losing the report entirely. busctl (systemd)
+    # is unaffected and present on every systemd distro, so it is the default.
+    if command -v busctl &>/dev/null; then
         local raw
         if raw=$(busctl --user --json=short call org.plasmazones /PlasmaZones org.plasmazones.Control generateSupportReport i "$SINCE_MINUTES" 2>/dev/null); then
             # Parse busctl JSON output: {"type":"s","data":["..."]}
@@ -92,8 +95,13 @@ call_dbus() {
             # embedded strings (e.g., literal backslash-n) may not round-trip perfectly.
             perl -e '$_=do{local $/;<STDIN>}; s/^s "//; s/"\s*$//; s/\\n/\n/g; s/\\t/\t/g; s/\\"/"/g; s/\\\\/\\/g; print' <<< "$raw"
         fi
+    elif command -v qdbus6 &>/dev/null; then
+        # Fallback only — see the busctl rationale above re: the Qt 6.11+ crash.
+        qdbus6 org.plasmazones /PlasmaZones org.plasmazones.Control.generateSupportReport "$SINCE_MINUTES"
+    elif command -v qdbus &>/dev/null; then
+        qdbus org.plasmazones /PlasmaZones org.plasmazones.Control.generateSupportReport "$SINCE_MINUTES"
     else
-        echo "Error: No D-Bus CLI tool found (qdbus6, qdbus, or busctl required)" >&2
+        echo "Error: No D-Bus CLI tool found (busctl, qdbus6, or qdbus required)" >&2
         exit 1
     fi
 }
@@ -190,14 +198,17 @@ if command -v journalctl &>/dev/null; then
         _jctl() { journalctl "$@"; }
     fi
 
+    # collect_journal <scope> <journalctl-args...>
+    #   <scope> is "--user" or "--system".
     collect_journal() {
+        local scope="$1"; shift
         local out err exit_code=0
         # Capture stdout and stderr separately so journalctl warnings
         # (e.g., "No entries") don't pollute the log output.
         err=$(mktemp "${TMPDIR:-/tmp}/pz-journal-err.XXXXXX")
         # Ensure temp file is cleaned up even if the script is killed mid-function.
         trap 'rm -f "$err"; trap - RETURN' RETURN
-        out=$(_jctl --user "$@" \
+        out=$(_jctl "$scope" "$@" \
             --since "$JOURNAL_SINCE min ago" \
             --no-pager -o short-iso 2>"$err") || exit_code=$?
         if [[ $exit_code -ne 0 ]] && [[ $exit_code -ne 1 ]]; then
@@ -209,18 +220,43 @@ if command -v journalctl &>/dev/null; then
         printf '%s' "$out"
     }
 
-    JOURNAL=$(collect_journal -t plasmazonesd)
+    JOURNAL=$(collect_journal --user -t plasmazonesd)
 
     # Fallback: try --identifier if -t returned nothing
     if [[ -z "${JOURNAL:-}" ]]; then
-        JOURNAL=$(collect_journal --identifier=plasmazonesd)
+        JOURNAL=$(collect_journal --user --identifier=plasmazonesd)
     fi
 
-    # Truncate to MaxLogLines, then redact via temp file to avoid SIGPIPE
+    # Truncate to the most recent MaxLogLines (the entries around a failure),
+    # then redact via temp file to avoid SIGPIPE. tail keeps the newest lines,
+    # matching SupportReport::capLogLines() in src/core/supportreport.cpp.
     if [[ -n "${JOURNAL:-}" ]]; then
         printf '%s\n' "$JOURNAL" > "$STAGING/journal.raw"
-        head -n "$MAX_LOG_LINES" "$STAGING/journal.raw" | redact_home > "$STAGING/journal.log"
+        tail -n "$MAX_LOG_LINES" "$STAGING/journal.raw" | redact_home > "$STAGING/journal.log"
         rm -f "$STAGING/journal.raw"
+    fi
+
+    # KWin effect logs: the effect runs inside the kwin_wayland process, so its
+    # journal is tagged "kwin_wayland", not "plasmazonesd". Filter to PlasmaZones
+    # lines (every effect log category contains "plasmazones"). Without this a
+    # non-loading effect — the most common "drags/shortcuts do nothing" cause —
+    # leaves no trace in the archive.
+    KWIN_JOURNAL=$(collect_journal --user -t kwin_wayland)
+    if [[ -z "${KWIN_JOURNAL:-}" ]]; then
+        KWIN_JOURNAL=$(collect_journal --user --identifier=kwin_wayland)
+    fi
+    # Fall back to the system journal: a compositor that is not a systemd user
+    # service logs there instead of the user journal.
+    if [[ -z "${KWIN_JOURNAL:-}" ]]; then
+        KWIN_JOURNAL=$(collect_journal --system -t kwin_wayland)
+    fi
+    if [[ -n "${KWIN_JOURNAL:-}" ]]; then
+        printf '%s\n' "$KWIN_JOURNAL" > "$STAGING/kwin-effect.raw"
+        grep -i plasmazones "$STAGING/kwin-effect.raw" 2>/dev/null \
+            | tail -n "$MAX_LOG_LINES" | redact_home > "$STAGING/kwin-effect.log" || true
+        rm -f "$STAGING/kwin-effect.raw"
+        # grep matched nothing → drop the empty file rather than ship a blank.
+        [[ -s "$STAGING/kwin-effect.log" ]] || rm -f "$STAGING/kwin-effect.log"
     fi
 fi
 
